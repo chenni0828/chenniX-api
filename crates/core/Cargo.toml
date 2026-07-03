@@ -1,0 +1,22 @@
+[package]
+name = "chennix-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chennix-common = { workspace = true }
+chennix-adaptor = { workspace = true }
+chennix-translator = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+chennix-storage = { workspace = true }
+evalexpr = { workspace = true }
+rand = { workspace = true }

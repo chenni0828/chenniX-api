@@ -1,0 +1,61 @@
+# chennix-api Docker Compose 部署文件
+# 架构: Internet → Caddy (80/443, 自动 HTTPS) → chennix-api (8080)
+#
+# 使用方法:
+#   1. 修改 Caddyfile 中的域名为你的域名
+#   2. 修改 .env 中的管理员密码
+#   3. docker compose up -d
+#
+# 数据持久化:
+#   - ./data:/data           SQLite 数据库
+#   - ./config.yaml:/app/config.yaml  配置文件
+#   - caddy_data/caddy_config         Caddy 证书和配置
+
+services:
+  chennix-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chennix-api:latest
+    container_name: chennix-api
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+      - RUST_LOG=info
+      - PORT=8080
+      - HOST=0.0.0.0
+      - DB_PATH=/data/chennix.db
+      - CHENNIX_ADMIN_PASSWORD=${CHENNIX_ADMIN_PASSWORD:-}
+    volumes:
+      # SQLite 数据库持久化（含 -wal/-shm 文件）
+      - ./data:/data
+      # 配置文件外挂（修改后重启容器生效）
+      - ./config.yaml:/app/config.yaml:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      chennix-api:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

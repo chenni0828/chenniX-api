@@ -1,0 +1,54 @@
+# chennix-api configuration file
+# Copy this file to config.yaml and adjust values as needed.
+# Start the server with:  chennix-api config.yaml
+
+# ── HTTP server settings ──────────────────────────────────────────────
+server:
+  # Bind address. Use "0.0.0.0" to listen on all interfaces,
+  # or "127.0.0.1" to restrict access to localhost only.
+  host: "0.0.0.0"
+  # TCP port the HTTP server listens on.
+  port: 8080
+  tls:
+    # Set to true to enable TLS. NOTE: built-in TLS termination is not
+    # yet implemented; use a reverse proxy (nginx/caddy) for TLS.
+    enabled: false
+    # Path to the TLS certificate file (PEM format).
+    cert: ""
+    # Path to the TLS private key file (PEM format).
+    key: ""
+  # 非流式上游请求整体超时（秒）。超时后视为可重试故障，尝试下一个 key。
+  upstream_timeout_secs: 60
+  # 流式请求首字节到达超时（秒）。不中断已建立的流。
+  streaming_timeout_secs: 300
+
+# ── Logging settings ──────────────────────────────────────────────────
+log:
+  # Log level: trace | debug | info | warn | error
+  # Can be overridden by the RUST_LOG environment variable.
+  level: "info"
+
+# ── Bootstrap settings ────────────────────────────────────────────────
+# On first startup (when the database is empty), the server will import
+# models, channels, keys, and model-channel bindings from the YAML file
+# specified below.
+#
+# See bootstrap.example.yaml for a complete template with all supported
+# fields (models, channels, keys, bindings) and inline documentation.
+# Copy it to bootstrap.yaml and fill in your actual API keys.
+#
+# The bootstrap file is only processed once (when the DB has zero channels).
+# Subsequent changes should be made via the admin API or admin panel.
+bootstrap:
+  # Path to the bootstrap YAML file used to seed initial data.
+  # Set to empty string "" to disable bootstrap import entirely.
+  config_file: "bootstrap.yaml"
+
+# ── Database settings ─────────────────────────────────────────────────
+database:
+  # Path to the SQLite database file. A new database will be created
+  # at this location if it does not already exist.
+  #
+  # 容器化部署默认 /data/chennix.db（挂载 /data 卷持久化）。
+  # 本地开发可改为 "chennix.db" 或通过 DB_PATH 环境变量覆盖。
+  path: "/data/chennix.db"

@@ -1,0 +1,50 @@
+# 参考项目源码 (不属于本项目)
+CLIProxyAPI-main/
+new-api-main/
+
+# Rust
+target/
+Cargo.lock
+*.rs.bk
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.log
+
+# 数据库文件
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# SDD 内部
+.superpowers/
+
+# 前端
+crates/server/web/node_modules/
+crates/server/static/
+crates/server/web/dist/
+
+# IDE workspaces
+.arts/
+.trae/
+
+# Tool snapshots
+.merkle-snapshot.json
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# 本地配置（使用 .example.yaml 作为模板）
+bootstrap.yaml
+config.yaml

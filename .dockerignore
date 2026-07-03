@@ -1,0 +1,48 @@
+# Docker 构建忽略文件，避免把不必要的内容送入构建上下文
+# 加速构建 + 减小上下文体积
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# 构建产物
+target/
+**/target/
+crates/server/static/
+crates/server/web/dist/
+crates/server/web/node_modules/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 文档（不需要进入镜像）
+docs/
+*.md
+!README.md
+LICENSE
+
+# 部署文件本身（不需要进入构建上下文）
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 测试产物
+**/*.rs.bk
+
+# 本地数据 / 日志
+data/
+*.db
+*.db-wal
+*.db-shm
+logs/
+
+# 临时文件
+*.tmp
+*.bak
+.cache/

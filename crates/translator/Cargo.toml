@@ -1,0 +1,10 @@
+[package]
+name = "chennix-translator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chennix-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }

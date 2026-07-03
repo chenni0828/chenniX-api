@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/common", "crates/storage", "crates/adaptor", "crates/translator", "crates/core", "crates/server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+chennix-common = { path = "crates/common" }
+chennix-storage = { path = "crates/storage" }
+chennix-adaptor = { path = "crates/adaptor" }
+chennix-translator = { path = "crates/translator" }
+chennix-core = { path = "crates/core" }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+async-trait = "0.1"
+bytes = "1"
+futures-util = "0.3"
+tokio-stream = "0.1"
+wiremock = "0.6"
+tempfile = "3"
+rust-embed = "8"
+mime_guess = "2"
+evalexpr = "13"
+rand = "0.8"

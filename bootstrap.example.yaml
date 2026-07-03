@@ -1,0 +1,102 @@
+# chennix-api bootstrap data file
+#
+# On first startup (when the database is empty), the server imports
+# models, channels, keys, and model-channel bindings from this file.
+# Copy this file to bootstrap.yaml and adjust values as needed.
+#
+# The file is only processed once — when the DB has zero channels.
+# Subsequent edits to bootstrap.yaml will NOT be re-imported.
+# Use the admin API or admin panel for runtime changes instead.
+#
+# Field names must match the structs in crates/storage/src/bootstrap.rs.
+
+# ── Models ────────────────────────────────────────────────────────────
+# Each model has a canonical_name (the primary identifier). Requests are
+# matched against canonical_name (case-insensitive). Add additional
+# canonical_name entries if you need multiple names to resolve to the
+# same model — aliases have been removed in favor of explicit entries.
+models:
+  - canonical_name: "gpt-4o"
+  - canonical_name: "gpt-4o-mini"
+  - canonical_name: "claude-3-5-sonnet"
+  - canonical_name: "deepseek-v3"
+
+# ── Channels ──────────────────────────────────────────────────────────
+# A channel represents an upstream API provider. The `provider` field
+# controls which adaptor is used for request/response translation:
+#   "anthropic"        → Claude-native API format
+#   "openai-compatible" (or any other value) → OpenAI-compatible API format
+channels:
+  - name: "OpenAI 官方"
+    provider: "openai-compatible"
+    base_url: "https://api.openai.com/v1"
+  - name: "Anthropic 官方"
+    provider: "anthropic"
+    base_url: "https://api.anthropic.com"
+  - name: "DeepSeek 官方"
+    provider: "openai-compatible"
+    base_url: "https://api.deepseek.com/v1"
+
+# ── Keys ──────────────────────────────────────────────────────────────
+# Each key belongs to a channel (referenced by `channel` name).
+# - cost_tier: "paid" or "free" (default: "paid"). Free keys consume
+#   free_quota before falling back to paid pricing.
+# - key_priority: lower = preferred (default: 100). Within the same
+#   channel, keys with lower priority are tried first.
+# - price_per_1k_tokens: cost in your billing currency per 1k tokens.
+#   If omitted, 1 token = 1 unit of quota.
+# - free_quota: monthly/daily free token allowance for free-tier keys.
+# - quota_reset_period: "monthly" or "daily" (informational).
+keys:
+  - channel: "OpenAI 官方"
+    api_key: "sk-your-openai-key-here"
+    label: "主账号"
+    cost_tier: "paid"
+    key_priority: 0
+    price_per_1k_tokens: 0.01
+
+  - channel: "Anthropic 官方"
+    api_key: "sk-ant-your-anthropic-key-here"
+    label: "主账号"
+    cost_tier: "paid"
+    key_priority: 0
+    price_per_1k_tokens: 0.015
+
+  - channel: "DeepSeek 官方"
+    api_key: "sk-your-deepseek-key-here"
+    label: "免费额度"
+    cost_tier: "free"
+    key_priority: 0
+    free_quota: 1000000
+    quota_reset_period: "monthly"
+    price_per_1k_tokens: 0.001
+
+# ── Bindings ──────────────────────────────────────────────────────────
+# A binding maps a model to a channel, specifying the upstream model
+# name that should be sent to that channel's API. A single model can
+# be bound to multiple channels for failover/redundancy.
+#
+# - model: the canonical_name defined above
+# - channel: the channel name defined above
+# - upstream_model_name: the model identifier the upstream API expects
+# - priority: binding-level call order (lower = tried first, default 100).
+#   When a model is bound to multiple channels, the binding with the
+#   lowest priority value is attempted first. Set this to control
+#   failover order on the Models page (drag-and-drop reorders these).
+bindings:
+  - model: "gpt-4o"
+    channel: "OpenAI 官方"
+    upstream_model_name: "gpt-4o"
+    priority: 10
+  - model: "gpt-4o-mini"
+    channel: "OpenAI 官方"
+    upstream_model_name: "gpt-4o-mini"
+    priority: 10
+  - model: "claude-3-5-sonnet"
+    channel: "Anthropic 官方"
+    upstream_model_name: "claude-3-5-sonnet-20241022"
+    priority: 10
+  - model: "deepseek-v3"
+    channel: "DeepSeek 官方"
+    upstream_model_name: "deepseek-chat"
+    priority: 10

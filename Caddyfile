@@ -1,0 +1,38 @@
+# chennix-api Caddyfile
+# 自动 HTTPS（Let's Encrypt）+ 反向代理到 chennix-api 容器
+#
+# 使用前：
+#   1. 把 example.com 改成你的域名
+#   2. 确保域名 DNS 已解析到本服务器 IP
+#   3. 确保 80/443 端口已开放（Caddy 需要访问 Let's Encrypt 验证）
+#
+# Caddy 会自动：
+#   - 申请 Let's Encrypt 证书
+#   - 配置 HTTPS
+#   - HTTP 自动跳转 HTTPS
+#   - 证书到期前自动续期
+
+example.com {
+    # 反向代理到 chennix-api 容器
+    reverse_proxy chennix-api:8080 {
+        # 流式响应需要禁用缓冲
+        flush_interval -1
+    }
+
+    # 压缩响应（对 API JSON 有效）
+    encode gzip zstd
+
+    # 安全头
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy no-referrer-when-downgrade
+    }
+
+    # 访问日志
+    log {
+        output stdout
+        format json
+    }
+}

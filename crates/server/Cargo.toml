@@ -1,0 +1,44 @@
+[package]
+name = "chennix-server"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "chennix_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chennix-api"
+path = "src/main.rs"
+
+[dependencies]
+chennix-common = { workspace = true }
+chennix-storage = { workspace = true }
+chennix-adaptor = { workspace = true }
+chennix-translator = { workspace = true }
+chennix-core = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+tokio-stream = { workspace = true }
+bcrypt = "0.15"
+async-trait = { workspace = true }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+tower = { version = "0.4", features = ["util"] }
