@@ -76,6 +76,13 @@
   }
 }
 
+/* 隐藏浏览器原生密码显示按钮（Edge/Chrome 的 ::-ms-reveal），
+   避免与自定义的 Eye/EyeOff 切换按钮重叠出现两个图标 */
+input[type="password"]::-ms-reveal,
+input[type="password"]::-ms-clear {
+  display: none;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

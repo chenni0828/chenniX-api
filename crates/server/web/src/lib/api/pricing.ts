@@ -60,7 +60,7 @@ export interface UpdateBindingPricingData {
 export const pricingApi = {
   /** 列出所有渠道-模型绑定及其定价 */
   list: () => api.get<BindingPricingRow[]>('/pricing').then((r) => r.data),
-  /** 更新某个 (model_id, channel_id) 绑定的定价 */
+  /** 更新某个 (model_id, channel_id, upstream_model_name) 三元组绑定的定价 */
   update: (modelId: number, data: UpdateBindingPricingData) =>
     api.put(`/models/${modelId}/pricing`, data).then((r) => r.data),
 }

@@ -171,7 +171,7 @@ export default function Pricing() {
                   const summary = pricingSummary(r.pricing)
                   const unconfigured = summary === "未配置"
                   return (
-                    <TableRow key={`${r.model_id}-${r.channel_id}`}>
+                    <TableRow key={`${r.model_id}-${r.channel_id}-${r.upstream_model_name ?? ""}`}>
                       <TableCell className="font-semibold">{r.canonical_name}</TableCell>
                       <TableCell>
                         <Badge variant="outline" className="font-normal">{r.channel_name}</Badge>

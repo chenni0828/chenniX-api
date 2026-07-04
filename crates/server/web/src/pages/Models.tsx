@@ -89,9 +89,12 @@ export default function Models() {
   // Per-binding test loading state, keyed by `${modelId}:${channelId}:${upstream}`
   const [testStates, setTestStates] = useState<Record<string, { loading: boolean }>>({})
 
-  // Reorder drag state: which binding is being dragged (within a model card, priority mode)
-  const [dragging, setDragging] = useState<{ modelId: number; channelId: number } | null>(null)
-  const [dragOver, setDragOver] = useState<{ modelId: number; channelId: number } | null>(null)
+  // Reorder drag state: which binding is being dragged (within a model card, priority mode).
+  // NOTE: model_channels PK is (model_id, channel_id, upstream_model_name), so the same
+  // channel can be bound multiple times via different upstreams — upstream MUST be part
+  // of the identity or drag/drop between same-channel bindings breaks.
+  const [dragging, setDragging] = useState<{ modelId: number; channelId: number; upstream: string } | null>(null)
+  const [dragOver, setDragOver] = useState<{ modelId: number; channelId: number; upstream: string } | null>(null)
 
   // Pool → card drop highlight (which large-model card is currently a drop target)
   const [dropTargetModelId, setDropTargetModelId] = useState<number | null>(null)
@@ -377,22 +380,22 @@ export default function Models() {
   }
 
   // ===== Reorder (priority mode, within a card) =====
-  const handleRowDragStart = (e: React.DragEvent, modelId: number, channelId: number) => {
-    e.dataTransfer.setData("text/plain", String(channelId))
+  const handleRowDragStart = (e: React.DragEvent, modelId: number, channelId: number, upstream: string) => {
+    e.dataTransfer.setData("text/plain", `${channelId}:${upstream}`)
     e.dataTransfer.effectAllowed = "move"
-    setDragging({ modelId, channelId })
+    setDragging({ modelId, channelId, upstream })
   }
 
-  const handleRowDragOver = (e: React.DragEvent, modelId: number, channelId: number) => {
+  const handleRowDragOver = (e: React.DragEvent, modelId: number, channelId: number, upstream: string) => {
     // Always allow the drop on a row; if it's a reorder drag we handle it here,
     // otherwise (pool drag) we let it bubble to the card-level drop handler.
     e.preventDefault()
     if (dragging && dragging.modelId === modelId) {
-      setDragOver({ modelId, channelId })
+      setDragOver({ modelId, channelId, upstream })
     }
   }
 
-  const handleRowDrop = async (e: React.DragEvent, m: ModelInfo, targetChannelId: number) => {
+  const handleRowDrop = async (e: React.DragEvent, m: ModelInfo, targetChannelId: number, targetUpstream: string) => {
     if (!dragging || dragging.modelId !== m.id) {
       // Not a reorder drag for this model — let the card-level handler deal with pool drags.
       return
@@ -400,15 +403,22 @@ export default function Models() {
     e.preventDefault()
     e.stopPropagation()
     const draggedChannelId = dragging.channelId
+    const draggedUpstream = dragging.upstream
     setDragging(null)
     setDragOver(null)
-    if (draggedChannelId === targetChannelId) return
+    // No-op when dropped onto itself (identified by the full 3-tuple, not just channel_id,
+    // because the same channel can be bound via multiple upstreams).
+    if (draggedChannelId === targetChannelId && draggedUpstream === targetUpstream) return
     const ordered = m.bindings.map(b => ({
       channel_id: b.channel_id,
       upstream_model_name: b.upstream_model_name,
     }))
-    const fromIdx = ordered.findIndex(b => b.channel_id === draggedChannelId)
-    const toIdx = ordered.findIndex(b => b.channel_id === targetChannelId)
+    const fromIdx = ordered.findIndex(
+      b => b.channel_id === draggedChannelId && b.upstream_model_name === draggedUpstream,
+    )
+    const toIdx = ordered.findIndex(
+      b => b.channel_id === targetChannelId && b.upstream_model_name === targetUpstream,
+    )
     if (fromIdx === -1 || toIdx === -1) return
     const [moved] = ordered.splice(fromIdx, 1)
     ordered.splice(toIdx, 0, moved)
@@ -675,16 +685,16 @@ export default function Models() {
                         const testKey = `${m.id}:${b.channel_id}:${b.upstream_model_name}`
                         const testState = testStates[testKey]
                         const wKey = weightKey(m.id, b.channel_id, b.upstream_model_name)
-                        const isDragOverRow = dragOver?.modelId === m.id && dragOver?.channelId === b.channel_id
-                        const isDraggingRow = dragging?.modelId === m.id && dragging?.channelId === b.channel_id
+                        const isDragOverRow = dragOver?.modelId === m.id && dragOver?.channelId === b.channel_id && dragOver?.upstream === b.upstream_model_name
+                        const isDraggingRow = dragging?.modelId === m.id && dragging?.channelId === b.channel_id && dragging?.upstream === b.upstream_model_name
                         const summary = pricingSummary(m.id, b.channel_id, b.upstream_model_name)
                         return (
                           <div
                             key={`${b.channel_id}:${b.upstream_model_name}`}
                             draggable={isPriority}
-                            onDragStart={(e) => isPriority && handleRowDragStart(e, m.id, b.channel_id)}
-                            onDragOver={(e) => handleRowDragOver(e, m.id, b.channel_id)}
-                            onDrop={(e) => handleRowDrop(e, m, b.channel_id)}
+                            onDragStart={(e) => isPriority && handleRowDragStart(e, m.id, b.channel_id, b.upstream_model_name)}
+                            onDragOver={(e) => handleRowDragOver(e, m.id, b.channel_id, b.upstream_model_name)}
+                            onDrop={(e) => handleRowDrop(e, m, b.channel_id, b.upstream_model_name)}
                             onDragEnd={handleRowDragEnd}
                             className={`flex items-center gap-2 rounded-md border px-2.5 py-2 transition-colors ${
                               isDragOverRow ? "border-primary bg-primary/5" : ""

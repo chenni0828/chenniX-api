@@ -58,6 +58,43 @@ export function generateKey(): string {
   return key
 }
 
+/**
+ * 复制文本到剪贴板。
+ *
+ * 优先用 `navigator.clipboard.writeText`（安全上下文：HTTPS / localhost）；
+ * 不可用时 fallback 到隐藏 textarea + `document.execCommand('copy')`，
+ * 保证通过 IP 访问（非 HTTPS）时也能正常复制。
+ *
+ * 返回 true 表示成功，false 表示失败。
+ */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  // 1. 优先用现代 Clipboard API（安全上下文）
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // 权限被拒或其它错误 → 走 fallback
+    }
+  }
+  // 2. fallback：隐藏 textarea + execCommand
+  try {
+    const ta = document.createElement("textarea")
+    ta.value = text
+    ta.style.position = "fixed"
+    ta.style.top = "-9999px"
+    ta.style.opacity = "0"
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    const ok = document.execCommand("copy")
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 /** Convert a datetime-local input value to Unix timestamp (seconds). */
 export function datetimeLocalToTimestamp(value: string): number {
   if (!value) return -1

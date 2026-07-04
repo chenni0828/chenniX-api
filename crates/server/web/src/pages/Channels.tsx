@@ -30,6 +30,7 @@ import {
   type SmallModel, type QuotaUnit, type QuotaWindow,
 } from "@/lib/api/models"
 import { toast } from "@/hooks/use-toast"
+import { copyToClipboard } from "@/lib/format"
 
 // ===== Constants & Helpers =====
 
@@ -1106,9 +1107,13 @@ export default function Channels() {
                                 size="icon"
                                 className="h-5 w-5 shrink-0"
                                 onClick={async () => {
-                                  await navigator.clipboard.writeText(k.api_key)
-                                  setCopiedKeyId(k.id)
-                                  setTimeout(() => setCopiedKeyId(null), 2000)
+                                  const ok = await copyToClipboard(k.api_key)
+                                  if (ok) {
+                                    setCopiedKeyId(k.id)
+                                    setTimeout(() => setCopiedKeyId(null), 2000)
+                                  } else {
+                                    toast({ title: "复制失败", variant: "destructive" })
+                                  }
                                 }}
                                 title="复制"
                               >

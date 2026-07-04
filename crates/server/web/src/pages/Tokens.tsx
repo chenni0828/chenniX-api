@@ -25,7 +25,7 @@ import { tokenApi, type TokenConfig, type CreateTokenPayload, type UpdateTokenPa
 import { userApi, type UserConfig } from "@/lib/api/users"
 import {
   formatNumber, formatDate, maskKey, getErrorMessage, generateKey,
-  datetimeLocalToTimestamp, timestampToDatetimeLocal,
+  datetimeLocalToTimestamp, timestampToDatetimeLocal, copyToClipboard,
 } from "@/lib/format"
 
 const STATUS_OPTIONS = [
@@ -189,12 +189,12 @@ export default function Tokens() {
   }, [currentUser, isAdmin])
 
   const copyKey = async (t: TokenConfig) => {
-    try {
-      await navigator.clipboard.writeText(t.key)
+    const ok = await copyToClipboard(t.key)
+    if (ok) {
       setCopiedId(t.id)
       toast({ title: "Key 已复制到剪贴板" })
       setTimeout(() => setCopiedId(null), 2000)
-    } catch {
+    } else {
       toast({ title: "复制失败", variant: "destructive" })
     }
   }
