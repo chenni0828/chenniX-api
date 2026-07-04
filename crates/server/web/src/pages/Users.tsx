@@ -18,7 +18,7 @@ import {
 import { useAuthStore } from "@/stores/auth"
 import { toast } from "@/hooks/use-toast"
 import { userApi, type UserConfig, type CreateUserPayload, type UpdateUserPayload } from "@/lib/api/users"
-import { formatNumber, formatQuota, getErrorMessage } from "@/lib/format"
+import { formatNumber, formatQuota, getErrorMessage, yuanToQuota, quotaToYuan } from "@/lib/format"
 
 const ROLE_OPTIONS = [
   { value: "1", label: "普通用户" },
@@ -81,8 +81,9 @@ export default function Users() {
   }, [fetchUsers, currentUser])
 
   // ── Create ──
+  // quota 字段：输入以「元」为单位，提交时由 yuanToQuota 转为微元
   const [createForm, setCreateForm] = useState({
-    username: "", password: "", role: "1", group: "default", quota: "1000000",
+    username: "", password: "", role: "1", group: "default", quota: "100",
   })
 
   const handleCreate = async () => {
@@ -97,12 +98,12 @@ export default function Users() {
         password: createForm.password,
         role: parseInt(createForm.role),
         group: createForm.group || "default",
-        quota: parseInt(createForm.quota) || 0,
+        quota: yuanToQuota(parseFloat(createForm.quota) || 0),
       }
       await userApi.create(payload)
       toast({ title: "用户创建成功" })
       setCreateOpen(false)
-      setCreateForm({ username: "", password: "", role: "1", group: "default", quota: "1000000" })
+      setCreateForm({ username: "", password: "", role: "1", group: "default", quota: "100" })
       fetchUsers()
     } catch (err) {
       toast({ title: "创建失败", description: getErrorMessage(err, "请重试"), variant: "destructive" })
@@ -122,7 +123,8 @@ export default function Users() {
       role: String(u.role),
       status: String(u.status),
       group: u.group,
-      quota: String(u.quota),
+      // 后端存微元，回显时除以 QUOTA_PER_YUAN 转为元
+      quota: String(quotaToYuan(u.quota)),
     })
     setEditTarget(u)
   }
@@ -136,7 +138,7 @@ export default function Users() {
         role: parseInt(editForm.role),
         status: parseInt(editForm.status),
         group: editForm.group || "default",
-        quota: parseInt(editForm.quota) || 0,
+        quota: yuanToQuota(parseFloat(editForm.quota) || 0),
       }
       await userApi.update(editTarget.id, payload)
       toast({ title: "用户更新成功" })
@@ -378,13 +380,14 @@ export default function Users() {
               </div>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="cu-quota">额度</Label>
+              <Label htmlFor="cu-quota">额度（元）</Label>
               <Input
                 id="cu-quota"
                 type="number"
+                step="0.000001"
                 value={createForm.quota}
                 onChange={(e) => setCreateForm({ ...createForm, quota: e.target.value })}
-                placeholder="1000000"
+                placeholder="100"
               />
             </div>
           </div>
@@ -447,10 +450,11 @@ export default function Users() {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="eu-quota">额度</Label>
+              <Label htmlFor="eu-quota">额度（元）</Label>
               <Input
                 id="eu-quota"
                 type="number"
+                step="0.000001"
                 value={editForm.quota}
                 onChange={(e) => setEditForm({ ...editForm, quota: e.target.value })}
               />

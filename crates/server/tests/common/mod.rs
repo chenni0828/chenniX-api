@@ -98,31 +98,33 @@ fn setup_test_db(openai_url: &str, claude_url: &str) -> SharedDb {
     init_db(&conn).unwrap();
 
     // --- Users ---
+    // quota 单位为微元（1 元 = 1_000_000 微元）。10000 元 = 10_000_000_000 微元。
     conn.execute(
         "INSERT INTO users (id, username, password_hash, role, status, quota, used_quota, \"group\")
-         VALUES (1, 'user1', 'h', 1, 1, 10000, 0, 'default')",
+         VALUES (1, 'user1', 'h', 1, 1, 10000000000, 0, 'default')",
         [],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO users (id, username, password_hash, role, status, quota, used_quota, \"group\")
-         VALUES (2, 'user2', 'h', 1, 1, 10000, 0, 'premium')",
+         VALUES (2, 'user2', 'h', 1, 1, 10000000000, 0, 'premium')",
         [],
     )
     .unwrap();
 
     // --- Tokens ---
+    // remain_quota 单位为微元。5000 元 = 5_000_000_000 微元。
     conn.execute(
         "INSERT INTO tokens (id, user_id, key, remain_quota, used_quota, unlimited_quota,
                              expired_time, model_limits_enabled, status)
-         VALUES (1, 1, 'sk-token1', 5000, 0, 0, -1, 0, 1)",
+         VALUES (1, 1, 'sk-token1', 5000000000, 0, 0, -1, 0, 1)",
         [],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO tokens (id, user_id, key, remain_quota, used_quota, unlimited_quota,
                              expired_time, model_limits_enabled, status)
-         VALUES (2, 2, 'sk-token2', 5000, 0, 0, -1, 0, 1)",
+         VALUES (2, 2, 'sk-token2', 5000000000, 0, 0, -1, 0, 1)",
         [],
     )
     .unwrap();

@@ -71,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // models.routing_strategy, discovered_models quota columns
     // (no-op on fresh v3 databases).
     chennix_storage::schema::migrate_v2_to_v3(&conn)?;
+    // Apply v3→v4 migration: convert money-quota fields to micro-yuan
+    // (×1,000,000) for integer-precision billing. Idempotent via
+    // schema_meta marker table.
+    chennix_storage::schema::migrate_v3_to_v4(&conn)?;
 
     // 4. Ensure default admin
     config::ensure_default_admin(&conn)?;

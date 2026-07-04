@@ -23,6 +23,7 @@ use chennix_storage::users::UserRepo;
 
 use chennix_adaptor::{build_claude_messages_url, build_models_url, build_openai_chat_url};
 use chennix_core::cache::CacheLoader;
+use chennix_core::tracker::UsageWriter;
 use crate::admin::error::{AdminError, AdminResult};
 use crate::state::AppState;
 
@@ -924,6 +925,100 @@ pub async fn reorder_bindings_handler(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// 记录测试连接请求到 request_logs 并从管理员账户扣费。
+///
+/// 测试连接发的是真实 chat 请求（消耗上游 token），因此必须扣费。
+/// 但测试不经过 executor 管道，无法走双层（user+token）扣费。处理方案：
+/// - 从**管理员** user.used_quota 扣除（admin 发起的测试由 admin 买单）
+/// - 仅写 request_logs（审计可见），不写 usage_logs（避免与真实业务用量混淆）
+/// - 成本按 binding 定价计算：1 input token + 1 output token（max_tokens=1）
+/// - 失败请求（连接错误/4xx/5xx）不扣费
+///
+/// 字段约定：
+/// - `method = "TEST"`：标记为测试请求，方便与正常请求区分
+/// - `user_id = admin_id`：计入管理员用量，便于追溯
+/// - `quota_cost`：按 binding 定价计算的微元成本
+async fn record_test_log(
+    state: &AppState,
+    admin_user_id: i64,
+    channel_name: &str,
+    key_label: Option<&str>,
+    path: &str,
+    upstream_status: Option<i64>,
+    success: bool,
+    latency_ms: u64,
+    error: Option<&str>,
+    quota_cost: i64,
+) {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response_status: i64 = if success { 200 } else { 502 };
+
+    // 1. 仅成功请求扣费（失败请求不消耗上游 token）
+    if success && quota_cost > 0 {
+        let db = state.db.lock().await;
+        let repo = UserRepo::new(&db);
+        if let Err(e) = repo.update_used_quota_delta(admin_user_id, quota_cost) {
+            tracing::warn!("test log: deduct admin used_quota failed: {}", e);
+        }
+    }
+
+    // 2. 写 request_logs（best-effort，不阻塞返回）
+    if let Err(e) = state
+        .storage
+        .log_request(
+            &request_id,
+            None, // client_ip — 管理员操作，无需记录
+            "TEST",
+            path,
+            None,
+            None,
+            Some(channel_name),
+            key_label,
+            None,
+            upstream_status,
+            response_status,
+            latency_ms as i64,
+            false,
+            error,
+            Some(admin_user_id), // user_id — 计入管理员用量
+            None,                // token_id — 测试无 token
+            quota_cost,
+        )
+        .await
+    {
+        tracing::warn!("record test log failed: {}", e);
+    }
+}
+
+/// 计算测试请求的成本（微元）。
+///
+/// 测试请求固定消耗 1 input token + 1 output token（max_tokens=1）。
+/// 按 binding 定价计算：
+/// - Token 模式：(input/1000 + output/1000) × QUOTA_PER_YUAN
+/// - PerCall 模式：call_price × QUOTA_PER_YUAN
+/// - Expression 模式：按 1+1 token 求值后 × QUOTA_PER_YUAN
+/// - 未配置定价（免费）：0
+fn compute_test_cost(pricing: &ChannelModelPricing) -> i64 {
+    use chennix_common::{BillingType, QUOTA_PER_YUAN};
+    if !pricing.is_configured() {
+        return 0;
+    }
+    let scale = QUOTA_PER_YUAN as f64;
+    let cost_yuan = match pricing.billing_type {
+        BillingType::Token => {
+            // 1 input + 1 output token
+            (pricing.input_price / 1000.0) + (pricing.output_price / 1000.0)
+        }
+        BillingType::PerCall => pricing.call_price,
+        BillingType::Expression => {
+            // 对 1+1 token 求值；失败则免费
+            chennix_core::billing_expr::eval(pricing.billing_expr.as_deref().unwrap_or("0"), 1, 1)
+                .unwrap_or(0.0)
+        }
+    };
+    (cost_yuan * scale).round() as i64
+}
+
 /// `POST /admin/api/channels/:id/test` 鈥?test connectivity for a channel.
 ///
 /// Sends a real chat completion request using the first bound model on the
@@ -932,10 +1027,12 @@ pub async fn reorder_bindings_handler(
 /// Includes upstream response body in error messages for easier debugging.
 pub async fn test_channel_handler(
     State(state): State<AppState>,
+    Extension(auth): Extension<AdminAuthContext>,
     Path(channel_id): Path<i64>,
 ) -> AdminResult<Json<ConnectionTestResult>> {
+    let admin_user_id = auth.user.id;
     // Scope the db lock so it is dropped before the HTTP request.
-    let (channel, api_key, test_model) = {
+    let (channel, api_key, key_label, test_model, pricing) = {
         let db = state.db.lock().await;
         let ch_repo = ChannelRepo::new(&db);
         let channel = ch_repo
@@ -944,14 +1041,22 @@ pub async fn test_channel_handler(
         let key_repo = KeyRepo::new(&db);
         let keys = key_repo.get_keys_for_channel(channel_id)?;
         let api_key = keys.first().map(|k| k.api_key.clone());
+        let key_label = keys.first().and_then(|k| k.label.clone());
         // Try to find a bound model to use as the test model name.
         let model_repo = ModelRepo::new(&db);
-        let test_model = model_repo
+        let binding = model_repo
             .get_bindings_for_channel(channel_id)?
             .into_iter()
-            .next()
-            .map(|b| b.upstream_model_name);
-        (channel, api_key, test_model)
+            .next();
+        let test_model = binding.as_ref().map(|b| b.upstream_model_name.clone());
+        // 取 binding 定价用于计算测试成本
+        let pricing = match &binding {
+            Some(b) => model_repo
+                .get_binding_pricing(b.model_id, b.channel_id, &b.upstream_model_name)?
+                .unwrap_or_default(),
+            None => ChannelModelPricing::default(),
+        };
+        (channel, api_key, key_label, test_model, pricing)
     }; // db lock dropped here
 
     let client = reqwest::Client::builder()
@@ -960,6 +1065,9 @@ pub async fn test_channel_handler(
         .map_err(|e| AdminError::Internal(format!("build http client: {}", e)))?;
 
     let start = std::time::Instant::now();
+    let log_path = format!("/admin/api/channels/{}/test", channel_id);
+    let channel_name = channel.name.clone();
+    let quota_cost = compute_test_cost(&pricing);
 
     if let Some(test_model) = &test_model {
         // Real chat completion test using the first bound model.
@@ -999,34 +1107,47 @@ pub async fn test_channel_handler(
             }
         }
 
-        match req.send().await {
+        let (result, upstream_status) = match req.send().await {
             Ok(resp) => {
                 let latency = start.elapsed().as_millis() as u64;
                 let status = resp.status();
+                let upstream_status = status.as_u16() as i64;
                 if status.is_success() {
-                    Ok(Json(ConnectionTestResult {
-                        success: true,
-                        latency_ms: latency,
-                        error: None,
-                    }))
+                    (ConnectionTestResult { success: true, latency_ms: latency, error: None }, Some(upstream_status))
                 } else {
                     let body = resp.text().await.unwrap_or_default();
-                    Ok(Json(ConnectionTestResult {
+                    (ConnectionTestResult {
                         success: false,
                         latency_ms: latency,
                         error: Some(format!("HTTP {}: {}", status, body)),
-                    }))
+                    }, Some(upstream_status))
                 }
             }
             Err(e) => {
                 let latency = start.elapsed().as_millis() as u64;
-                Ok(Json(ConnectionTestResult {
+                (ConnectionTestResult {
                     success: false,
                     latency_ms: latency,
                     error: Some(e.to_string()),
-                }))
+                }, None)
             }
-        }
+        };
+
+        // 记录测试日志 + 扣费（仅成功请求扣费）
+        record_test_log(
+            &state,
+            admin_user_id,
+            &channel_name,
+            key_label.as_deref(),
+            &log_path,
+            upstream_status,
+            result.success,
+            result.latency_ms,
+            result.error.as_deref(),
+            quota_cost,
+        ).await;
+
+        Ok(Json(result))
     } else {
         // No bound models — fall back to basic connectivity check (GET /models).
         let url = build_models_url(&channel.base_url);
@@ -1043,34 +1164,50 @@ pub async fn test_channel_handler(
                 }
             }
         }
-        match req.send().await {
+        let result = match req.send().await {
             Ok(resp) => {
                 let latency = start.elapsed().as_millis() as u64;
                 let status = resp.status();
                 if status.is_success() {
-                    Ok(Json(ConnectionTestResult {
+                    ConnectionTestResult {
                         success: true,
                         latency_ms: latency,
                         error: Some("no models bound - only basic connectivity verified".to_string()),
-                    }))
+                    }
                 } else {
                     let body = resp.text().await.unwrap_or_default();
-                    Ok(Json(ConnectionTestResult {
+                    ConnectionTestResult {
                         success: false,
                         latency_ms: latency,
                         error: Some(format!("HTTP {}: {}", status, body)),
-                    }))
+                    }
                 }
             }
             Err(e) => {
                 let latency = start.elapsed().as_millis() as u64;
-                Ok(Json(ConnectionTestResult {
+                ConnectionTestResult {
                     success: false,
                     latency_ms: latency,
                     error: Some(e.to_string()),
-                }))
+                }
             }
-        }
+        };
+
+        // 无 binding 时 quota_cost = 0（compute_test_cost 返回 0）
+        record_test_log(
+            &state,
+            admin_user_id,
+            &channel_name,
+            key_label.as_deref(),
+            &log_path,
+            None,
+            result.success,
+            result.latency_ms,
+            result.error.as_deref(),
+            0,
+        ).await;
+
+        Ok(Json(result))
     }
 }
 
@@ -1083,10 +1220,12 @@ pub async fn test_channel_handler(
 /// - Anthropic: `POST /v1/messages`
 pub async fn test_model_handler(
     State(state): State<AppState>,
+    Extension(auth): Extension<AdminAuthContext>,
     Path(model_id): Path<i64>,
 ) -> AdminResult<Json<ConnectionTestResult>> {
+    let admin_user_id = auth.user.id;
     // Scope the db lock so it is dropped before the HTTP request.
-    let (channel, api_key, upstream_model_name) = {
+    let (channel, api_key, key_label, upstream_model_name, pricing) = {
         let db = state.db.lock().await;
         let model_repo = ModelRepo::new(&db);
 
@@ -1116,7 +1255,11 @@ pub async fn test_model_handler(
         let key_repo = KeyRepo::new(&db);
         let keys = key_repo.get_keys_for_channel(binding.channel_id)?;
         let api_key = keys.first().map(|k| k.api_key.clone());
-        (channel, api_key, binding.upstream_model_name.clone())
+        let key_label = keys.first().and_then(|k| k.label.clone());
+        let pricing = model_repo
+            .get_binding_pricing(binding.model_id, binding.channel_id, &binding.upstream_model_name)?
+            .unwrap_or_default();
+        (channel, api_key, key_label, binding.upstream_model_name.clone(), pricing)
     }; // db lock dropped here
 
     let client = reqwest::Client::builder()
@@ -1161,33 +1304,52 @@ pub async fn test_model_handler(
             }
         }
     }
-    let result = req.send().await;
-    let latency = start.elapsed().as_millis() as u64;
 
-    match result {
+    let log_path = format!("/admin/api/models/{}/test", model_id);
+    let channel_name = channel.name.clone();
+    let quota_cost = compute_test_cost(&pricing);
+
+    let (result, upstream_status) = match req.send().await {
         Ok(resp) => {
+            let latency = start.elapsed().as_millis() as u64;
             let status = resp.status();
+            let upstream_status = status.as_u16() as i64;
             if status.is_success() {
-                Ok(Json(ConnectionTestResult {
-                    success: true,
-                    latency_ms: latency,
-                    error: None,
-                }))
+                (ConnectionTestResult { success: true, latency_ms: latency, error: None }, Some(upstream_status))
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                Ok(Json(ConnectionTestResult {
+                (ConnectionTestResult {
                     success: false,
                     latency_ms: latency,
                     error: Some(format!("HTTP {}: {}", status, body)),
-                }))
+                }, Some(upstream_status))
             }
         }
-        Err(e) => Ok(Json(ConnectionTestResult {
-            success: false,
-            latency_ms: latency,
-            error: Some(e.to_string()),
-        })),
-    }
+        Err(e) => {
+            let latency = start.elapsed().as_millis() as u64;
+            (ConnectionTestResult {
+                success: false,
+                latency_ms: latency,
+                error: Some(e.to_string()),
+            }, None)
+        }
+    };
+
+    // 记录测试日志 + 扣费（仅成功请求扣费）
+    record_test_log(
+        &state,
+        admin_user_id,
+        &channel_name,
+        key_label.as_deref(),
+        &log_path,
+        upstream_status,
+        result.success,
+        result.latency_ms,
+        result.error.as_deref(),
+        quota_cost,
+    ).await;
+
+    Ok(Json(result))
 }
 
 /// `POST /admin/api/models/:id/bindings/:channel_id/test` 鈥?test a specific
@@ -1210,11 +1372,13 @@ pub struct TestBindingRequest {
 
 pub async fn test_binding_handler(
     State(state): State<AppState>,
+    Extension(auth): Extension<AdminAuthContext>,
     Path(model_id): Path<i64>,
     Json(payload): Json<TestBindingRequest>,
 ) -> AdminResult<Json<ConnectionTestResult>> {
+    let admin_user_id = auth.user.id;
     // Scope the db lock so it is dropped before the HTTP request.
-    let (channel, api_key, upstream_model_name) = {
+    let (channel, api_key, key_label, upstream_model_name, pricing) = {
         let db = state.db.lock().await;
         let model_repo = ModelRepo::new(&db);
 
@@ -1248,7 +1412,11 @@ pub async fn test_binding_handler(
         let key_repo = KeyRepo::new(&db);
         let keys = key_repo.get_keys_for_channel(binding.channel_id)?;
         let api_key = keys.first().map(|k| k.api_key.clone());
-        (channel, api_key, binding.upstream_model_name.clone())
+        let key_label = keys.first().and_then(|k| k.label.clone());
+        let pricing = model_repo
+            .get_binding_pricing(binding.model_id, binding.channel_id, &binding.upstream_model_name)?
+            .unwrap_or_default();
+        (channel, api_key, key_label, binding.upstream_model_name.clone(), pricing)
     }; // db lock dropped here
 
     let client = reqwest::Client::builder()
@@ -1293,33 +1461,52 @@ pub async fn test_binding_handler(
             }
         }
     }
-    let result = req.send().await;
-    let latency = start.elapsed().as_millis() as u64;
 
-    match result {
+    let log_path = format!("/admin/api/models/{}/bindings/test", model_id);
+    let channel_name = channel.name.clone();
+    let quota_cost = compute_test_cost(&pricing);
+
+    let (result, upstream_status) = match req.send().await {
         Ok(resp) => {
+            let latency = start.elapsed().as_millis() as u64;
             let status = resp.status();
+            let upstream_status = status.as_u16() as i64;
             if status.is_success() {
-                Ok(Json(ConnectionTestResult {
-                    success: true,
-                    latency_ms: latency,
-                    error: None,
-                }))
+                (ConnectionTestResult { success: true, latency_ms: latency, error: None }, Some(upstream_status))
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                Ok(Json(ConnectionTestResult {
+                (ConnectionTestResult {
                     success: false,
                     latency_ms: latency,
                     error: Some(format!("HTTP {}: {}", status, body)),
-                }))
+                }, Some(upstream_status))
             }
         }
-        Err(e) => Ok(Json(ConnectionTestResult {
-            success: false,
-            latency_ms: latency,
-            error: Some(e.to_string()),
-        })),
-    }
+        Err(e) => {
+            let latency = start.elapsed().as_millis() as u64;
+            (ConnectionTestResult {
+                success: false,
+                latency_ms: latency,
+                error: Some(e.to_string()),
+            }, None)
+        }
+    };
+
+    // 记录测试日志 + 扣费（仅成功请求扣费）
+    record_test_log(
+        &state,
+        admin_user_id,
+        &channel_name,
+        key_label.as_deref(),
+        &log_path,
+        upstream_status,
+        result.success,
+        result.latency_ms,
+        result.error.as_deref(),
+        quota_cost,
+    ).await;
+
+    Ok(Json(result))
 }
 
 /// `GET /admin/api/channels/:id/models` 鈥?list models supported by a channel.

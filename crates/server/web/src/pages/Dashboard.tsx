@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/table"
 import { dashboardApi, type DashboardResponse } from "@/lib/api/dashboard"
 import { tokenApi, type TokenConfig } from "@/lib/api/tokens"
+import { formatDate, formatCost } from "@/lib/format"
 
 function formatNumber(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M"
@@ -237,14 +238,14 @@ export default function Dashboard() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {topModels.slice(0, 6).map((m, i) => (
-                    <TableRow key={i}>
+                  {topModels.slice(0, 6).map((m) => (
+                    <TableRow key={`${m.model}`}>
                       <TableCell className="font-medium max-w-[120px] truncate" title={m.model}>
                         {m.model}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{formatNumber(m.total_tokens)}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatNumber(m.request_count)}</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">{formatNumber(m.total_cost)}</TableCell>
+                      <TableCell className="text-right tabular-nums text-muted-foreground">{formatCost(m.total_cost)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -294,7 +295,7 @@ export default function Dashboard() {
                       color: "var(--color-popover-foreground)",
                       fontSize: "13px",
                     }}
-                    formatter={(value: number) => [formatNumber(value), "已用额度"]}
+                    formatter={(value: number) => [formatCost(value), "已用额度（元）"]}
                   />
                 </PieChart>
               </ResponsiveContainer>
@@ -306,7 +307,7 @@ export default function Dashboard() {
                       style={{ backgroundColor: PIE_COLORS[i % PIE_COLORS.length] }}
                     />
                     <span className="truncate max-w-[120px]" title={item.name}>{item.name}</span>
-                    <span className="ml-auto tabular-nums text-muted-foreground">{formatNumber(item.value)}</span>
+                    <span className="ml-auto tabular-nums text-muted-foreground">{formatCost(item.value)} 元</span>
                   </div>
                 ))}
               </div>
@@ -334,7 +335,7 @@ export default function Dashboard() {
                   <TableHead>模型</TableHead>
                   <TableHead>渠道</TableHead>
                   <TableHead>状态</TableHead>
-                  <TableHead className="text-right">Token</TableHead>
+                  <TableHead className="text-right">消耗</TableHead>
                   <TableHead className="text-right">耗时</TableHead>
                 </TableRow>
               </TableHeader>
@@ -342,7 +343,7 @@ export default function Dashboard() {
                 {recentRequests.map((r) => (
                   <TableRow key={r.id}>
                     <TableCell className="text-muted-foreground whitespace-nowrap">
-                      {r.created_at}
+                      {formatDate(r.created_at)}
                     </TableCell>
                     <TableCell className="font-medium max-w-[140px] truncate" title={r.normalized_model ?? r.client_model ?? ""}>
                       {r.normalized_model ?? r.client_model ?? "—"}
@@ -357,7 +358,7 @@ export default function Dashboard() {
                         <Badge variant="success">{r.response_status}</Badge>
                       )}
                     </TableCell>
-                    <TableCell className="text-right tabular-nums">{formatNumber(r.quota_cost)}</TableCell>
+                    <TableCell className="text-right tabular-nums text-muted-foreground">{formatCost(r.quota_cost)}</TableCell>
                     <TableCell className="text-right tabular-nums text-muted-foreground">
                       {r.duration_ms}ms
                     </TableCell>

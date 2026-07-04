@@ -24,8 +24,9 @@ import { toast } from "@/hooks/use-toast"
 import { tokenApi, type TokenConfig, type CreateTokenPayload, type UpdateTokenPayload, type TokenUsage } from "@/lib/api/tokens"
 import { userApi, type UserConfig } from "@/lib/api/users"
 import {
-  formatNumber, formatDate, maskKey, getErrorMessage, generateKey,
+  formatNumber, formatDate, formatCost, maskKey, getErrorMessage, generateKey,
   datetimeLocalToTimestamp, timestampToDatetimeLocal, copyToClipboard,
+  yuanToQuota, quotaToYuan,
 } from "@/lib/format"
 
 const STATUS_OPTIONS = [
@@ -99,7 +100,7 @@ function QuotaUsageCell({ token }: { token: TokenConfig }) {
           />
         </div>
         <span className="text-xs tabular-nums text-muted-foreground whitespace-nowrap">
-          {formatNumber(token.used_quota)}/{formatNumber(totalQuota)}
+          {formatCost(token.used_quota)}/{formatCost(totalQuota)} 元
         </span>
       </div>
       {/* Hover detail popover */}
@@ -205,8 +206,9 @@ export default function Tokens() {
   }
 
   // ── Create ──
+  // remain_quota 字段：输入以「元」为单位，提交时由 yuanToQuota 转为微元
   const [createForm, setCreateForm] = useState({
-    name: "", assign_user_id: "", remain_quota: "1000000", unlimited_quota: false,
+    name: "", assign_user_id: "", remain_quota: "10", unlimited_quota: false,
     expired_time: "", model_limits: "", model_limits_enabled: false,
     allow_ips: "",
   })
@@ -221,7 +223,7 @@ export default function Tokens() {
       const payload: CreateTokenPayload = {
         name: createForm.name,
         key: generateKey(),
-        remain_quota: parseInt(createForm.remain_quota) || 0,
+        remain_quota: yuanToQuota(parseFloat(createForm.remain_quota) || 0),
         unlimited_quota: createForm.unlimited_quota,
         expired_time: createForm.expired_time ? datetimeLocalToTimestamp(createForm.expired_time) : -1,
         model_limits: createForm.model_limits,
@@ -236,7 +238,7 @@ export default function Tokens() {
       toast({ title: "Token 创建成功" })
       setCreateOpen(false)
       setCreateForm({
-        name: "", assign_user_id: "", remain_quota: "1000000", unlimited_quota: false,
+        name: "", assign_user_id: "", remain_quota: "10", unlimited_quota: false,
         expired_time: "", model_limits: "", model_limits_enabled: false, allow_ips: "",
       })
       fetchTokens()
@@ -257,7 +259,8 @@ export default function Tokens() {
   const openEdit = (t: TokenConfig) => {
     setEditForm({
       name: t.name || "",
-      remain_quota: String(t.remain_quota),
+      // 后端存微元，回显时除以 QUOTA_PER_YUAN 转为元
+      remain_quota: String(quotaToYuan(t.remain_quota)),
       unlimited_quota: t.unlimited_quota,
       expired_time: timestampToDatetimeLocal(t.expired_time),
       model_limits: t.model_limits?.join(", ") || "",
@@ -274,7 +277,7 @@ export default function Tokens() {
     try {
       const payload: UpdateTokenPayload = {
         name: editForm.name,
-        remain_quota: parseInt(editForm.remain_quota) || 0,
+        remain_quota: yuanToQuota(parseFloat(editForm.remain_quota) || 0),
         unlimited_quota: editForm.unlimited_quota,
         expired_time: editForm.expired_time ? datetimeLocalToTimestamp(editForm.expired_time) : -1,
         model_limits: editForm.model_limits,
@@ -406,7 +409,7 @@ export default function Tokens() {
                           <span className="flex items-center justify-end gap-1 text-muted-foreground">
                             <InfinityIcon className="h-3 w-3" />无限
                           </span>
-                        ) : formatNumber(t.remain_quota)}
+                        ) : `${formatCost(t.remain_quota)} 元`}
                       </TableCell>
                       <TableCell className="text-xs">{formatDate(t.expired_time)}</TableCell>
                       <TableCell className="text-xs">
@@ -466,8 +469,8 @@ export default function Tokens() {
             )}
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="ct-quota">额度</Label>
-                <Input id="ct-quota" type="number" value={createForm.remain_quota}
+                <Label htmlFor="ct-quota">额度（元）</Label>
+                <Input id="ct-quota" type="number" step="0.000001" value={createForm.remain_quota}
                   onChange={(e) => setCreateForm({ ...createForm, remain_quota: e.target.value })}
                   disabled={createForm.unlimited_quota} />
               </div>
@@ -544,8 +547,8 @@ export default function Tokens() {
               </div>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="et-quota">剩余额度</Label>
-              <Input id="et-quota" type="number" value={editForm.remain_quota}
+              <Label htmlFor="et-quota">剩余额度（元）</Label>
+              <Input id="et-quota" type="number" step="0.000001" value={editForm.remain_quota}
                 onChange={(e) => setEditForm({ ...editForm, remain_quota: e.target.value })}
                 disabled={editForm.unlimited_quota} />
             </div>

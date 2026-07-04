@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use chennix_common::{BillingType, ChannelModelPricing, ChannelProvider, ProxyError, ProxyResult, Usage};
+use chennix_common::{BillingType, ChannelModelPricing, ChannelProvider, ProxyError, ProxyResult, QUOTA_PER_YUAN, Usage};
 
 use chennix_adaptor::{Adaptor, ClaudeAdaptor, OpenaiAdaptor};
 
@@ -130,20 +130,21 @@ fn estimate_cost(pricing: Option<&ChannelModelPricing>, max_tokens: Option<u64>)
     let Some(p) = pricing.filter(|p| p.is_configured()) else {
         return 0;
     };
+    let scale = QUOTA_PER_YUAN as f64;
     match p.billing_type {
         BillingType::Token => {
             let cost = (ASSUMED_PROMPT / 1000.0) * p.input_price
                 + (assumed_completion / 1000.0) * p.output_price;
-            (cost.round() as i64).max(1)
+            (cost * scale).round() as i64
         }
-        BillingType::PerCall => (p.call_price.round() as i64).max(1),
+        BillingType::PerCall => (p.call_price * scale).round() as i64,
         BillingType::Expression => {
             let expr = p
                 .billing_expr
                 .as_deref()
                 .unwrap_or("0");
             match billing_expr::eval(expr, ASSUMED_PROMPT as u64, assumed_completion as u64) {
-                Ok(v) => (v.round() as i64).max(1),
+                Ok(v) => (v * scale).round() as i64,
                 Err(_) => 0,
             }
         }
@@ -182,20 +183,21 @@ pub fn actual_cost(
     let Some(p) = pricing.filter(|p| p.is_configured()) else {
         return 0;
     };
+    let scale = QUOTA_PER_YUAN as f64;
     match p.billing_type {
         BillingType::Token => {
             let input_cost = (usage.prompt_tokens as f64 / 1000.0) * p.input_price;
             let output_cost = (usage.completion_tokens as f64 / 1000.0) * p.output_price;
-            (input_cost + output_cost).round() as i64
+            ((input_cost + output_cost) * scale).round() as i64
         }
-        BillingType::PerCall => p.call_price.round() as i64,
+        BillingType::PerCall => (p.call_price * scale).round() as i64,
         BillingType::Expression => {
             let expr = p
                 .billing_expr
                 .as_deref()
                 .unwrap_or("0");
             match billing_expr::eval(expr, usage.prompt_tokens, usage.completion_tokens) {
-                Ok(v) => v.round() as i64,
+                Ok(v) => (v * scale).round() as i64,
                 Err(_) => 0,
             }
         }
@@ -301,6 +303,27 @@ fn pick_adaptor(provider: ChannelProvider) -> Box<dyn Adaptor> {
         ChannelProvider::OpenaiCompatible => Box::new(OpenaiAdaptor::new()),
         ChannelProvider::Anthropic => Box::new(ClaudeAdaptor::new()),
     }
+}
+
+/// Non-streaming execution outcome. Carries both the response body and
+/// the audit metadata the HTTP handler needs to write a complete
+/// `request_logs` row (channel/key/cost/upstream status). Without this
+/// struct the handler would only have `Bytes` and could not fill in
+/// channel_name / key_label / quota_cost, leaving the audit log empty.
+#[derive(Debug)]
+pub struct ExecutionResult {
+    /// Final response body (possibly cross-format translated).
+    pub body: Bytes,
+    /// Name of the channel that served the request.
+    pub channel_name: String,
+    /// Label of the key that served the request (if any).
+    pub key_label: Option<String>,
+    /// Upstream HTTP status code (None if the adaptor did not expose one).
+    pub upstream_status: Option<i64>,
+    /// Actual cost in the storage unit (micro-yuan).
+    pub quota_cost: i64,
+    /// All key labels attempted before success (for audit).
+    pub attempted_keys: Vec<String>,
 }
 
 /// Bootstrap result returned by `execute_stream`. The upstream has accepted
@@ -414,7 +437,7 @@ impl Executor {
         billing_repo: &dyn BillingRepo,
         usage_writer: &dyn UsageWriter,
         cache_loader: &dyn crate::cache::CacheLoader,
-    ) -> ProxyResult<Bytes> {
+    ) -> ProxyResult<ExecutionResult> {
         let candidates = self.select_keys(ctx, cache_loader).await?;
         if candidates.is_empty() {
             return Err(ProxyError::AllKeysExhausted {
@@ -494,7 +517,7 @@ impl Executor {
                     ProxyError::UpstreamTimeout(self.upstream_timeout)
                 })?;
             match exec_result {
-                Ok((_status, bytes)) => {
+                Ok((upstream_status_code, bytes)) => {
                     // Extract usage from the upstream-native response.
                     let usage_value: serde_json::Value =
                         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
@@ -559,7 +582,14 @@ impl Executor {
                             translate_response_back(entry_format, adaptor_provider, usage_value)?;
                         Bytes::from(serde_json::to_vec(&translated)?)
                     };
-                    return Ok(final_body);
+                    return Ok(ExecutionResult {
+                        body: final_body,
+                        channel_name: rk.channel.name.clone(),
+                        key_label: rk.key.label.clone(),
+                        upstream_status: Some(upstream_status_code as i64),
+                        quota_cost: cost,
+                        attempted_keys: attempted.clone(),
+                    });
                 }
                 Err(e) => {
                     let err_str = e.to_string();
@@ -971,54 +1001,60 @@ mod tests {
     #[test]
     fn test_estimate_cost_token_mode() {
         // estimate_cost assumes 500 prompt + 500 completion tokens (default).
-        // input: 500/1000 * 0.03 = 0.015
-        // output: 500/1000 * 0.06 = 0.03
-        // total = 0.045 → rounds to 0, but .max(1) → 1
+        // 内部存储为微元（1 元 = 1_000_000 微元）。
+        // input: 500/1000 * 0.03 = 0.015 元
+        // output: 500/1000 * 0.06 = 0.03 元
+        // total = 0.045 元 → 0.045 * 1_000_000 = 45000 微元
         let p = token_pricing(0.03, 0.06);
-        assert_eq!(estimate_cost(Some(&p), None), 1);
+        assert_eq!(estimate_cost(Some(&p), None), 45000);
 
-        // Larger prices: 500 * 10/1000 + 500 * 20/1000 = 5 + 10 = 15
+        // Larger prices: 500 * 10/1000 + 500 * 20/1000 = 5 + 10 = 15 元
+        // → 15 * 1_000_000 = 15_000_000 微元
         let p = token_pricing(10.0, 20.0);
-        assert_eq!(estimate_cost(Some(&p), None), 15);
+        assert_eq!(estimate_cost(Some(&p), None), 15_000_000);
     }
 
     #[test]
     fn test_estimate_cost_token_mode_with_max_tokens() {
-        // With max_tokens=2000: 500 * 10/1000 + 2000 * 20/1000 = 5 + 40 = 45
+        // With max_tokens=2000: 500 * 10/1000 + 2000 * 20/1000 = 5 + 40 = 45 元
+        // → 45 * 1_000_000 = 45_000_000 微元
         let p = token_pricing(10.0, 20.0);
-        assert_eq!(estimate_cost(Some(&p), Some(2000)), 45);
+        assert_eq!(estimate_cost(Some(&p), Some(2000)), 45_000_000);
     }
 
     #[test]
     fn test_estimate_cost_percall_mode() {
-        // Per-call estimate = call_price, min 1.
+        // Per-call estimate = call_price × 1_000_000 微元
         let p = percall_pricing(0.5);
-        assert_eq!(estimate_cost(Some(&p), None), 1);
+        assert_eq!(estimate_cost(Some(&p), None), 500_000);
 
         let p = percall_pricing(7.0);
-        assert_eq!(estimate_cost(Some(&p), None), 7);
+        assert_eq!(estimate_cost(Some(&p), None), 7_000_000);
     }
 
     #[test]
     fn test_estimate_cost_expression_mode() {
-        // Expression uses assumed 500/500 tokens. `p + c` → 1000.
+        // Expression uses assumed 500/500 tokens. `p + c` → 1000 元
+        // → 1000 * 1_000_000 = 1_000_000_000 微元
         let p = expr_pricing("p + c");
-        assert_eq!(estimate_cost(Some(&p), None), 1000);
+        assert_eq!(estimate_cost(Some(&p), None), 1_000_000_000);
 
-        // Fixed per-call style via expression: constant.
+        // Fixed per-call style via expression: 3 元 → 3_000_000 微元
         let p = expr_pricing("3");
-        assert_eq!(estimate_cost(Some(&p), None), 3);
+        assert_eq!(estimate_cost(Some(&p), None), 3_000_000);
 
-        // Tiered via `if(cond, then, else)` builtin: total = 1000 > 500 → 10.
+        // Tiered via `if(cond, then, else)` builtin: total = 1000 > 500 → 10 元
+        // → 10 * 1_000_000 = 10_000_000 微元
         let p = expr_pricing("if(total > 500, 10, 2)");
-        assert_eq!(estimate_cost(Some(&p), None), 10);
+        assert_eq!(estimate_cost(Some(&p), None), 10_000_000);
     }
 
     #[test]
     fn test_estimate_cost_expression_mode_with_max_tokens() {
-        // max_tokens=1000 → p=500, c=1000, total=1500 > 500 → 10
+        // max_tokens=1000 → p=500, c=1000, total=1500 > 500 → 10 元
+        // → 10 * 1_000_000 = 10_000_000 微元
         let p = expr_pricing("if(total > 500, 10, 2)");
-        assert_eq!(estimate_cost(Some(&p), Some(1000)), 10);
+        assert_eq!(estimate_cost(Some(&p), Some(1000)), 10_000_000);
     }
 
     #[test]
@@ -1064,27 +1100,27 @@ mod tests {
     #[test]
     fn test_actual_cost_token_mode() {
         let p = token_pricing(0.03, 0.06);
-        // Small usage → rounds to 0
+        // 内部存储为微元（1 元 = 1_000_000 微元）。
         let u = Usage { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 };
-        // input: 1000/1000 * 0.03 = 0.03
-        // output: 500/1000 * 0.06 = 0.03
-        // total = 0.06 → 0
-        assert_eq!(actual_cost(&u, Some(&p)), 0);
+        // input: 1000/1000 * 0.03 = 0.03 元
+        // output: 500/1000 * 0.06 = 0.03 元
+        // total = 0.06 元 → 0.06 * 1_000_000 = 60000 微元
+        assert_eq!(actual_cost(&u, Some(&p)), 60000);
 
         // Larger usage → non-zero
         let u = Usage { prompt_tokens: 100_000, completion_tokens: 50_000, total_tokens: 150_000 };
-        // input: 100000/1000 * 0.03 = 3.0
-        // output: 50000/1000 * 0.06 = 3.0
-        // total = 6.0 → 6
-        assert_eq!(actual_cost(&u, Some(&p)), 6);
+        // input: 100000/1000 * 0.03 = 3.0 元
+        // output: 50000/1000 * 0.06 = 3.0 元
+        // total = 6.0 元 → 6 * 1_000_000 = 6_000_000 微元
+        assert_eq!(actual_cost(&u, Some(&p)), 6_000_000);
     }
 
     #[test]
     fn test_actual_cost_percall_mode() {
         let p = percall_pricing(2.0);
         let u = Usage { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 };
-        // Per-call: call_price regardless of tokens → 2
-        assert_eq!(actual_cost(&u, Some(&p)), 2);
+        // Per-call: call_price × 1_000_000 → 2_000_000 微元
+        assert_eq!(actual_cost(&u, Some(&p)), 2_000_000);
     }
 
     #[test]
@@ -1092,18 +1128,18 @@ mod tests {
         // p + c
         let p = expr_pricing("p + c");
         let u = Usage { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 };
-        // 1000 + 500 = 1500
-        assert_eq!(actual_cost(&u, Some(&p)), 1500);
+        // 1000 + 500 = 1500 元 → 1500 * 1_000_000 = 1_500_000_000 微元
+        assert_eq!(actual_cost(&u, Some(&p)), 1_500_000_000);
 
         // Tiered by total via `if(cond, then, else)` builtin
         let p = expr_pricing("if(total > 1000, total * 0.01, 5)");
         let u = Usage { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 };
-        // total=1500 > 1000 → 1500 * 0.01 = 15
-        assert_eq!(actual_cost(&u, Some(&p)), 15);
+        // total=1500 > 1000 → 1500 * 0.01 = 15 元 → 15_000_000 微元
+        assert_eq!(actual_cost(&u, Some(&p)), 15_000_000);
 
         let u = Usage { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 };
-        // total=200 ≤ 1000 → 5
-        assert_eq!(actual_cost(&u, Some(&p)), 5);
+        // total=200 ≤ 1000 → 5 元 → 5_000_000 微元
+        assert_eq!(actual_cost(&u, Some(&p)), 5_000_000);
     }
 
     // ---------- prepare_request / translate_response_back ----------

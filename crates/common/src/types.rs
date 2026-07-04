@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// 1 元 = 1,000,000 微元（内部配额单位）。
+///
+/// 所有 money-quota 字段（users.quota / tokens.remain_quota /
+/// usage_logs.quota_cost / request_logs.quota_cost）均以微元存储，
+/// 保证整数运算无精度损失（1 微元 = 0.000001 元，足以精确记录单次
+/// token 级别的成本）。参考 new-api 的 QuotaPerUnit 设计。
+pub const QUOTA_PER_YUAN: i64 = 1_000_000;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChannelProvider {

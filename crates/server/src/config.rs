@@ -5,7 +5,7 @@
 //! is a necessary addition because the server needs to know where to
 //! open the SQLite database.
 
-use chennix_common::{ProxyError, ProxyResult};
+use chennix_common::{ProxyError, ProxyResult, QUOTA_PER_YUAN};
 use rusqlite::Connection;
 use serde::Deserialize;
 
@@ -189,7 +189,7 @@ pub fn ensure_default_admin(conn: &Connection) -> ProxyResult<()> {
             conn.execute(
                 "INSERT INTO users (username, password_hash, role, status, quota, used_quota, \"group\")
                  VALUES (?1, ?2, ?3, 1, ?4, 0, 'default')",
-                rusqlite::params!["admin", password_hash, 100, 999_999_999_i64],
+                rusqlite::params!["admin", password_hash, 100, 999_999_999_i64 * QUOTA_PER_YUAN],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
 
@@ -399,7 +399,7 @@ bootstrap:
             )
             .unwrap();
         assert_eq!(role, 100, "admin role must be 100 (root)");
-        assert_eq!(quota, 999_999_999, "admin quota must be 999999999");
+        assert_eq!(quota, 999_999_999 * QUOTA_PER_YUAN, "admin quota must be 999999999 元 in micro-yuan");
         assert_eq!(status, 1, "admin status must be enabled");
         assert_eq!(group, "default");
 

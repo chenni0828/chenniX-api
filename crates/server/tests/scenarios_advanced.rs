@@ -157,8 +157,8 @@ async fn test_scenario_6_cross_format_openai_to_claude() {
 // stream with a final usage chunk (prompt=100000, completion=50000,
 // total=150000).  We verify:
 //   1. Client receives SSE-formatted data.
-//   2. After stream ends, billing is settled (user.used_quota = 2,
-//      token.remain_quota = 4998).
+//   2. After stream ends, billing is settled (user.used_quota = 1_500_000 微元,
+//      token.remain_quota = 4_998_500_000).
 //   3. A usage log row is created.
 
 #[tokio::test]
@@ -167,7 +167,7 @@ async fn test_scenario_7_streaming_sse() {
     let env = common::setup().await;
 
     // Custom SSE mock with large token counts for non-trivial billing.
-    // actual_cost = (150000 / 1000 * 0.01).round() = 2
+    // actual_cost = (150000 / 1000 * 0.01) * 1_000_000 = 1_500_000 微元
     let sse_body = concat!(
         "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n",
         "data: {\"id\":\"chat-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n",
@@ -216,19 +216,19 @@ async fn test_scenario_7_streaming_sse() {
     // ensures the spawned task has completed.
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-    // Assert — billing settled
-    // estimate_cost = 10, actual_cost = 2, refund = 8
-    // net: user.used = 2, token.remain = 4998
+    // Assert — billing settled (微元: 1 元 = 1_000_000 微元)
+    // estimate_cost = 10000 微元, actual_cost = 1_500_000 微元, extra charge = 1_490_000
+    // net: user.used = 1_500_000, token.remain = 5_000_000_000 - 1_500_000 = 4_998_500_000
     let conn = env.db().await;
     assert_eq!(
         common::get_user_used_quota(&conn, common::USER1_ID),
-        2,
-        "user.used_quota should be 2 after streaming billing settlement"
+        1_500_000,
+        "user.used_quota should be 1_500_000 微元 after streaming billing settlement"
     );
     assert_eq!(
         common::get_token_remain(&conn, common::TOKEN1_ID),
-        4998,
-        "token.remain_quota should be 4998"
+        4_998_500_000,
+        "token.remain_quota should be 4_998_500_000"
     );
     assert_eq!(
         common::count_usage_logs(&conn),

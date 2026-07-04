@@ -43,10 +43,12 @@ channels:
 #   free_quota before falling back to paid pricing.
 # - key_priority: lower = preferred (default: 100). Within the same
 #   channel, keys with lower priority are tried first.
-# - price_per_1k_tokens: cost in your billing currency per 1k tokens.
-#   If omitted, 1 token = 1 unit of quota.
-# - free_quota: monthly/daily free token allowance for free-tier keys.
-# - quota_reset_period: "monthly" or "daily" (informational).
+# - price_per_1k_tokens: 上游定价元数据（元/1K tokens，浮点）。
+#   仅用于 Key 管理界面展示与排序，不参与用户计费。用户实际计费
+#   以 `bindings.pricing`（model_channels 表）为准。
+# - free_quota: 上游提供的免费 token 额度（token 数量，非金额）。
+#   free-tier Key 的 used_quota 累计到此值后转为付费。
+# - quota_reset_period: "monthly" 或 "daily"（仅信息标记）。
 keys:
   - channel: "OpenAI 官方"
     api_key: "sk-your-openai-key-here"

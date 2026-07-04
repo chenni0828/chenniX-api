@@ -77,12 +77,13 @@ async fn test_scenario_1_multi_user() {
 // ---------------------------------------------------------------------------
 //
 // token1 requests gpt-4o with a mock that returns total_tokens=150000.
-// Billing math (price_per_1k_tokens = 0.01):
-//   estimate_cost = (1000.0 * 0.01).round().max(1) = 10
-//   actual_cost   = (150000.0 / 1000.0 * 0.01).round() = (1.5).round() = 2
-//   pre_charge deducts 10 from both user and token layers.
-//   settle refunds 8 (10 - 2) to both layers.
-//   Net: user.used_quota = 2, token.remain_quota = 5000 - 2 = 4998.
+// Billing math (price = 0.01 元/1K tokens, 内部存储为微元 1 元 = 1_000_000 微元):
+//   estimate_cost = (500/1000 * 0.01 + 500/1000 * 0.01) * 1_000_000 = 10000 微元
+//   actual_cost   = (100000/1000 * 0.01 + 50000/1000 * 0.01) * 1_000_000
+//                 = (1.0 + 0.5) * 1_000_000 = 1_500_000 微元
+//   pre_charge deducts 10000 from both user and token layers.
+//   settle charges extra 1_490_000 (1_500_000 - 10000) to both layers.
+//   Net: user.used_quota = 1_500_000, token.remain_quota = 5_000_000_000 - 1_500_000 = 4_998_500_000.
 
 #[tokio::test]
 async fn test_scenario_2_dual_layer_billing() {
@@ -104,34 +105,34 @@ async fn test_scenario_2_dual_layer_billing() {
 
     let conn = env.db().await;
 
-    // User layer: used_quota should be 2 (net after pre-charge + settle).
+    // User layer: used_quota should be 1_500_000 微元 (net after pre-charge + settle).
     let user_used = common::get_user_used_quota(&conn, common::USER1_ID);
     assert_eq!(
-        user_used, 2,
-        "user.used_quota should be 2 (actual_cost), got {}",
+        user_used, 1_500_000,
+        "user.used_quota should be 1_500_000 微元 (actual_cost), got {}",
         user_used
     );
 
-    // Token layer: remain_quota should be 5000 - 2 = 4998.
+    // Token layer: remain_quota should be 5_000_000_000 - 1_500_000 = 4_998_500_000.
     let token_remain = common::get_token_remain(&conn, common::TOKEN1_ID);
     assert_eq!(
-        token_remain, 4998,
-        "token.remain_quota should be 4998, got {}",
+        token_remain, 4_998_500_000,
+        "token.remain_quota should be 4_998_500_000, got {}",
         token_remain
     );
 
-    // Token used_quota should also be 2.
+    // Token used_quota should also be 1_500_000.
     let token_used = common::get_token_used(&conn, common::TOKEN1_ID);
     assert_eq!(
-        token_used, 2,
-        "token.used_quota should be 2, got {}",
+        token_used, 1_500_000,
+        "token.used_quota should be 1_500_000, got {}",
         token_used
     );
 
-    // usage_logs should have one row with quota_cost = 2.
+    // usage_logs should have one row with quota_cost = 1_500_000.
     assert_eq!(common::count_usage_logs(&conn), 1);
     let (_, _, _, quota_cost) = common::get_first_usage_log(&conn);
-    assert_eq!(quota_cost, 2, "quota_cost in usage_logs should be 2");
+    assert_eq!(quota_cost, 1_500_000, "quota_cost in usage_logs should be 1_500_000 微元");
 }
 
 // ---------------------------------------------------------------------------

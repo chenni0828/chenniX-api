@@ -10,6 +10,7 @@ use axum::extract::State;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use chennix_common::QUOTA_PER_YUAN;
 use chennix_storage::users::UserRepo;
 
 use crate::admin::error::{AdminError, AdminResult};
@@ -65,10 +66,10 @@ pub async fn setup_initialize_handler(
         return Err(AdminError::BadRequest("系统已初始化，请直接登录".into()));
     }
 
-    // 3. 创建管理员（role=100, quota=999999999, group=default, status=1）
+    // 3. 创建管理员（role=100, quota=999_999_999 元 = 999_999_999 微元 × QUOTA_PER_YUAN, group=default, status=1）
     let hash = bcrypt::hash(&payload.password, bcrypt::DEFAULT_COST)
         .map_err(|e| AdminError::Internal(format!("bcrypt hash failed: {}", e)))?;
-    repo.create_user_with_quota(username, &hash, 100, "default", 999_999_999)?;
+    repo.create_user_with_quota(username, &hash, 100, "default", 999_999_999_i64 * QUOTA_PER_YUAN)?;
 
     tracing::info!("setup wizard: created initial admin user '{}'", username);
     Ok(Json(InitializeResponse { success: true }))

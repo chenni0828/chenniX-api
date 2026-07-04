@@ -357,6 +357,65 @@ pub fn migrate_v2_to_v3(conn: &Connection) -> ProxyResult<()> {
     Ok(())
 }
 
+/// Migrate a v3 database to v4: convert money-quota fields from 元 (yuan)
+/// to 微元 (micro-yuan, 1 元 = 1,000,000 微元) so small per-request costs
+/// are not rounded to zero.
+///
+/// Affected fields (money — NOT token-count fields like
+/// `channel_keys.used_quota` or `discovered_models.used_quota`):
+/// - `users.quota`, `users.used_quota`
+/// - `tokens.remain_quota`, `tokens.used_quota`
+/// - `usage_logs.quota_cost`
+/// - `request_logs.quota_cost`
+///
+/// Idempotency: uses a `schema_meta` table marker to skip on fresh v4 or
+/// already-migrated databases.
+pub fn migrate_v3_to_v4(conn: &Connection) -> ProxyResult<()> {
+    // Idempotency: check the migration marker.
+    let migrated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='schema_meta'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if migrated > 0 {
+        let done: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_meta WHERE key='v4_micro_yuan'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if done > 0 {
+            return Ok(());
+        }
+    }
+
+    // Multiply all money-quota fields by 1,000,000.
+    // Fields that are 0 stay 0; NULL-safe (COALESCE not needed — all are
+    // NOT NULL DEFAULT 0 in the schema).
+    let scale: i64 = 1_000_000;
+    conn.execute_batch(&format!(
+        "UPDATE users SET quota = quota * {scale}, used_quota = used_quota * {scale};
+         UPDATE tokens SET remain_quota = remain_quota * {scale}, used_quota = used_quota * {scale};
+         UPDATE usage_logs SET quota_cost = quota_cost * {scale};
+         UPDATE request_logs SET quota_cost = quota_cost * {scale};",
+    ))
+    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+
+    // Record the migration marker.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
+         INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('v4_micro_yuan', 'done');",
+    )
+    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+
+    tracing::info!("migrate_v3_to_v4: converted money-quota fields to micro-yuan (×1,000,000)");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

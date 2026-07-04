@@ -260,10 +260,15 @@ pub async fn proxy_request(
             )
             .await
         {
-            Ok(bytes) => {
-                // 审计日志：非流式成功。cost/channel/key 等细节已由
-                // executor 内部 track_success 写入 usage_logs；此处仅记录
-                // 请求级审计信息。
+            Ok(result) => {
+                // 审计日志：非流式成功。executor 已通过 track_success 写入
+                // usage_logs；此处补全 request_logs 的渠道/key/cost 等审计
+                // 字段（之前因 execute 只返回 Bytes 而丢失这些信息）。
+                let attempted_keys_csv = if result.attempted_keys.is_empty() {
+                    None
+                } else {
+                    Some(result.attempted_keys.join(","))
+                };
                 log_request_entry(
                     &state,
                     &request_id,
@@ -272,23 +277,23 @@ pub async fn proxy_request(
                     path,
                     client_model.as_deref(),
                     Some(&canonical_name),
-                    None,
-                    None,
-                    None,
-                    None,
+                    Some(&result.channel_name),
+                    result.key_label.as_deref(),
+                    attempted_keys_csv.as_deref(),
+                    result.upstream_status,
                     200,
                     start.elapsed().as_millis() as i64,
                     false,
                     None,
                     Some(user_id),
                     Some(token_id),
-                    0,
+                    result.quota_cost,
                 )
                 .await;
                 Ok(Response::builder()
                     .status(200)
                     .header("content-type", "application/json")
-                    .body(Body::from(bytes))
+                    .body(Body::from(result.body))
                     .unwrap())
             }
             Err(e) => {

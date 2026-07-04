@@ -2,18 +2,46 @@
  * Shared formatting utilities for admin pages.
  */
 
-/** Format a date value (Unix seconds or SQLite datetime string) to a readable string. */
+/**
+ * 将日期值格式化为北京时间字符串。
+ *
+ * 输入支持：
+ * - Unix 时间戳（秒，number）
+ * - SQLite datetime('now') 字符串（UTC，格式 "2026-07-04 17:51:00"）
+ *
+ * 输出统一为北京时间（Asia/Shanghai，UTC+8），格式 "2026-07-05 01:51:00"。
+ * 显式指定时区，避免依赖浏览器/服务器本地时区设置。本项目面向中国用户，
+ * 所有时间展示均以北京时间为准。
+ *
+ * 参考实现：new-api 使用 dayjs 配合时区插件；此处用原生 Intl.DateTimeFormat
+ * 指定 timeZone: "Asia/Shanghai"，无需引入额外依赖。
+ */
 export function formatDate(ts: number | string | null | undefined): string {
   if (ts === null || ts === undefined) return "-"
+  let d: Date
   if (typeof ts === "number") {
     if (ts <= 0) return "永不过期"
-    return new Date(ts * 1000).toLocaleString("zh-CN")
+    d = new Date(ts * 1000)
+  } else {
+    if (!ts) return "-"
+    // SQLite datetime('now') 存储的是 UTC 时间，格式 "2026-07-04 17:51:00"。
+    // 末尾追加 'Z' 让 JS 按 UTC 解析；若不加，JS 会按本地时区解析导致偏移。
+    d = new Date(ts.replace(" ", "T") + "Z")
   }
-  if (!ts) return "-"
-  // SQLite datetime format: "2026-07-01 12:34:56"
-  const d = new Date(ts.replace(" ", "T"))
-  if (isNaN(d.getTime())) return ts
-  return d.toLocaleString("zh-CN")
+  if (isNaN(d.getTime())) return String(ts)
+  // 显式指定 Asia/Shanghai 时区，确保无论运行环境时区如何都显示北京时间
+  const fmt = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  })
+  // Intl 输出格式为 "2026/07/05 01:51:00"，统一替换为连字符以匹配 new-api 风格
+  return fmt.format(d).replace(/\//g, "-")
 }
 
 /** Format a number with thousands separators. */
@@ -22,17 +50,65 @@ export function formatNumber(n: number | null | undefined): string {
   return n.toLocaleString("zh-CN")
 }
 
-/** Format a cost/quota value. */
+/**
+ * 内部配额单位常量：1 元 = 1,000,000 微元。
+ *
+ * 后端所有 money-quota 字段（users.quota / tokens.remain_quota /
+ * usage_logs.quota_cost / request_logs.quota_cost）均以微元（i64）存储，
+ * 保证整数运算无精度损失。前端展示与输入以「元」为单位，需通过此常量
+ * 进行换算。参考 new-api 的 QuotaPerUnit 设计。
+ */
+export const QUOTA_PER_YUAN = 1_000_000
+
+/**
+ * 将微元（内部整数配额）格式化为元（人民币）字符串。
+ *
+ * - 入参为后端原始值（微元，i64 范围）
+ * - 输出按人民币习惯展示：≤0.01 元时保留 6 位小数以体现微小成本，
+ *   否则保留 2 位小数 + 千分位分隔
+ *
+ * 例：formatCost(1_500_000) → "1.50"
+ *     formatCost(15)        → "0.000015"
+ *     formatCost(0)         → "0"
+ *     formatCost(null)      → "-"
+ */
 export function formatCost(n: number | null | undefined): string {
   if (n === null || n === undefined) return "-"
-  return n.toLocaleString("zh-CN")
+  const yuan = n / QUOTA_PER_YUAN
+  if (!isFinite(yuan)) return "-"
+  if (yuan === 0) return "0"
+  // 微小成本（< 1 分）保留 6 位小数；否则保留 2 位
+  const digits = Math.abs(yuan) < 0.01 ? 6 : 2
+  return yuan.toLocaleString("zh-CN", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })
 }
 
-/** Compute quota usage percentage and display text. */
+/**
+ * 将元（人民币，浮点）转为微元（内部整数配额）。
+ * 用于前端 quota 输入框提交到后端时的换算。
+ *
+ * 向上取整以避免扣费不足（与后端 actual_cost 的 .round() 取整一致）。
+ * 例：yuanToQuota(0.000001) === 1
+ */
+export function yuanToQuota(yuan: number): number {
+  return Math.round(yuan * QUOTA_PER_YUAN)
+}
+
+/**
+ * 将微元（内部整数配额）转为元（人民币，浮点）。
+ * 用于前端 quota 输入框回显后端值时的换算。
+ */
+export function quotaToYuan(quota: number): number {
+  return quota / QUOTA_PER_YUAN
+}
+
+/** Compute quota usage percentage and display text (input in micro-yuan). */
 export function formatQuota(used: number, total: number): { percent: number; text: string } {
-  if (total <= 0) return { percent: 0, text: `${formatNumber(used)} / ∞` }
+  if (total <= 0) return { percent: 0, text: `${formatCost(used)} 元 / ∞` }
   const percent = Math.min(100, Math.round((used / total) * 100))
-  return { percent, text: `${formatNumber(used)} / ${formatNumber(total)}` }
+  return { percent, text: `${formatCost(used)} / ${formatCost(total)} 元` }
 }
 
 /** Mask a token key: sk-xxxx...xxxx */
