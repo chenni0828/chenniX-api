@@ -88,28 +88,20 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route("/admin/api/channels/:id/discover-models", post(discover_channel_models_handler))
         .route(
             "/admin/api/channels/:id/discovered-models",
-            post(add_discovered_models_handler),
-        )
-        .route(
-            "/admin/api/channels/:id/discovered-models/:upstream",
-            delete(delete_discovered_model_handler),
+            post(add_discovered_models_handler).delete(delete_discovered_model_handler),
         )
         .route(
             "/admin/api/channels/:id/models",
-            get(list_channel_models_handler).post(add_channel_model_handler),
-        )
-        .route(
-            "/admin/api/channels/:id/models/:model_name",
-            delete(remove_channel_model_handler),
+            get(list_channel_models_handler),
         )
         // Small-model quota management
         .route("/admin/api/small-models", get(list_small_models_handler))
         .route(
-            "/admin/api/channels/:id/models/:upstream/quota",
+            "/admin/api/channels/:id/models/quota",
             patch(update_small_model_quota_handler),
         )
         .route(
-            "/admin/api/channels/:id/models/:upstream/quota/reset",
+            "/admin/api/channels/:id/models/quota/reset",
             post(reset_small_model_quota_handler),
         )
         // Keys CRUD (nested under channels)
@@ -147,11 +139,11 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             put(reorder_bindings_handler),
         )
         .route(
-            "/admin/api/models/:id/bindings/:channel_id/:upstream",
+            "/admin/api/models/:id/bindings/remove",
             delete(remove_binding_handler),
         )
         .route(
-            "/admin/api/models/:id/bindings/:channel_id/:upstream/test",
+            "/admin/api/models/:id/bindings/test",
             post(test_binding_handler),
         )
         // Reload

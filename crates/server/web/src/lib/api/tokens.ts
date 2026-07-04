@@ -13,7 +13,6 @@ export interface TokenConfig {
   model_limits: string[] | null
   status: number
   allow_ips: string[] | null
-  group?: string
 }
 
 export interface CreateTokenPayload {

@@ -33,7 +33,8 @@ export interface SmallModel {
 }
 
 export interface UpdateSmallModelQuotaData {
-  limit: number
+  /** null 表示无限制 */
+  limit: number | null
   unit: QuotaUnit
   window: QuotaWindow
 }
@@ -66,7 +67,7 @@ export interface CreateModelData {
 }
 
 export interface UpdateModelData {
-  canonical_name?: string
+  canonical_name: string
 }
 
 export const modelApi = {
@@ -98,8 +99,10 @@ export const modelApi = {
         weight,
       })
       .then(r => r.data),
-  removeBinding: (modelId: number, channelId: number) =>
-    api.delete(`/models/${modelId}/bindings/${channelId}`).then(r => r.data),
+  removeBinding: (modelId: number, channelId: number, upstream: string) =>
+    api.delete(`/models/${modelId}/bindings/remove`, {
+      data: { channel_id: channelId, upstream_model_name: upstream },
+    }).then(r => r.data),
   reorder: (
     modelId: number,
     bindings: { channel_id: number; upstream_model_name: string }[],
@@ -108,7 +111,8 @@ export const modelApi = {
   testBinding: (modelId: number, channelId: number, upstream: string) =>
     api
       .post<ChannelTestResult>(
-        `/models/${modelId}/bindings/${channelId}/${encodeURIComponent(upstream)}/test`,
+        `/models/${modelId}/bindings/test`,
+        { channel_id: channelId, upstream_model_name: upstream },
       )
       .then(r => r.data),
   /** 列出所有渠道下发现的小模型（discovered_models）及其额度状态与已绑定大模型计数 */
@@ -120,11 +124,16 @@ export const modelApi = {
     quota: UpdateSmallModelQuotaData,
   ): Promise<void> =>
     api
-      .patch(`/channels/${channelId}/models/${encodeURIComponent(upstream)}/quota`, quota)
+      .patch(`/channels/${channelId}/models/quota`, {
+        upstream_model_name: upstream,
+        ...quota,
+      })
       .then(r => r.data),
   /** 重置某渠道下指定上游小模型的额度用量 */
   resetSmallModelQuota: (channelId: number, upstream: string): Promise<void> =>
     api
-      .post(`/channels/${channelId}/models/${encodeURIComponent(upstream)}/quota/reset`)
+      .post(`/channels/${channelId}/models/quota/reset`, {
+        upstream_model_name: upstream,
+      })
       .then(r => r.data),
 }

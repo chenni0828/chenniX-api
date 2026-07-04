@@ -207,6 +207,7 @@ pub struct ListTokensQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTokenRequest {
+    #[serde(default)]
     pub user_id: i64,
     pub name: String,
     pub key: Option<String>,
@@ -872,17 +873,25 @@ pub async fn update_binding_weight_handler(
     Ok(Json(()))
 }
 
-/// `DELETE /admin/api/models/:id/bindings/:channel_id/:upstream` — remove a
+/// `DELETE /admin/api/models/:id/bindings/remove` — remove a
 /// single `(model_id, channel_id, upstream_model_name)` triple binding.
-/// `:upstream` is URL-decoded by axum automatically.
+/// `upstream_model_name` is sent in the request body to avoid URL encoding
+/// issues with model names containing `/` (e.g. `meta-llama/Llama-3`).
+#[derive(Debug, Deserialize)]
+pub struct RemoveBindingRequest {
+    pub channel_id: i64,
+    pub upstream_model_name: String,
+}
+
 pub async fn remove_binding_handler(
     State(state): State<AppState>,
-    Path((model_id, channel_id, upstream)): Path<(i64, i64, String)>,
+    Path(model_id): Path<i64>,
+    Json(payload): Json<RemoveBindingRequest>,
 ) -> AdminResult<Json<serde_json::Value>> {
     {
         let db = state.db.lock().await;
         let repo = ModelRepo::new(&db);
-        repo.remove_binding(model_id, channel_id, &upstream)?;
+        repo.remove_binding(model_id, payload.channel_id, &payload.upstream_model_name)?;
     }
     // Invalidate cache so the removed binding stops being routed.
     state.cache.invalidate().await;
@@ -1190,9 +1199,19 @@ pub async fn test_model_handler(
 /// `test_model_handler` (which always picks the highest-priority binding),
 /// this handler targets a specific binding so the admin can validate each
 /// channel implementation independently.
+///
+/// `channel_id` and `upstream_model_name` are sent in the request body to
+/// avoid URL encoding issues with model names containing `/`.
+#[derive(Debug, Deserialize)]
+pub struct TestBindingRequest {
+    pub channel_id: i64,
+    pub upstream_model_name: String,
+}
+
 pub async fn test_binding_handler(
     State(state): State<AppState>,
-    Path((model_id, channel_id, upstream)): Path<(i64, i64, String)>,
+    Path(model_id): Path<i64>,
+    Json(payload): Json<TestBindingRequest>,
 ) -> AdminResult<Json<ConnectionTestResult>> {
     // Scope the db lock so it is dropped before the HTTP request.
     let (channel, api_key, upstream_model_name) = {
@@ -1211,11 +1230,11 @@ pub async fn test_binding_handler(
         let binding = model_repo
             .get_bindings_for_model(model_id)?
             .into_iter()
-            .find(|b| b.channel_id == channel_id && b.upstream_model_name == upstream)
+            .find(|b| b.channel_id == payload.channel_id && b.upstream_model_name == payload.upstream_model_name)
             .ok_or_else(|| {
                 AdminError::NotFound(format!(
                     "binding for model {} on channel {} (upstream {}) not found",
-                    model_id, channel_id, upstream
+                    model_id, payload.channel_id, payload.upstream_model_name
                 ))
             })?;
 
@@ -1547,77 +1566,6 @@ pub async fn discover_models_by_form_handler(
     Ok(Json(serde_json::json!({ "models": models })))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AddChannelModelRequest {
-    pub model_name: String,
-    pub upstream_model_name: String,
-}
-
-/// `POST /admin/api/channels/:id/models` 鈥?add a model to a channel.
-///
-/// Looks up `model_name` via canonical name (case-insensitive). If not found,
-/// creates a new model with `canonical_name = model_name`. Then binds it to
-/// the channel with the given `upstream_model_name`. The new binding is
-/// appended to the end of the priority queue.
-pub async fn add_channel_model_handler(
-    State(state): State<AppState>,
-    Path(channel_id): Path<i64>,
-    Json(payload): Json<AddChannelModelRequest>,
-) -> AdminResult<Json<serde_json::Value>> {
-    let model_id = {
-        let db = state.db.lock().await;
-        let model_repo = ModelRepo::new(&db);
-        let ch_repo = ChannelRepo::new(&db);
-
-        // Verify channel exists.
-        ch_repo
-            .get_channel_by_id(channel_id)?
-            .ok_or_else(|| AdminError::NotFound(format!("channel {} not found", channel_id)))?;
-
-        // Find model by canonical_name; create if missing.
-        let model_id = match model_repo.get_model_by_name(&payload.model_name)? {
-            Some((id, _)) => id,
-            None => model_repo.create_model(&payload.model_name)?,
-        };
-
-        // Append to the end of the priority queue.
-        let existing = model_repo.get_bindings_for_model(model_id)?;
-        let priority = (existing.len() as i32) * 10 + 10;
-        model_repo.add_binding(model_id, channel_id, &payload.upstream_model_name, priority)?;
-        model_id
-    };
-    // Invalidate cache so the new binding is immediately routable.
-    state.cache.invalidate().await;
-    Ok(Json(serde_json::json!({ "success": true, "model_id": model_id })))
-}
-
-/// `DELETE /admin/api/channels/:id/models/:model_name` 鈥?remove a model from a channel.
-///
-/// Resolves `model_name` via canonical name (case-insensitive), then removes
-/// the binding between that model and the channel.
-pub async fn remove_channel_model_handler(
-    State(state): State<AppState>,
-    Path((channel_id, model_name)): Path<(i64, String)>,
-) -> AdminResult<Json<serde_json::Value>> {
-    {
-        let db = state.db.lock().await;
-        let model_repo = ModelRepo::new(&db);
-
-        // Find model by canonical_name.
-        let (model_id, _) = model_repo
-            .get_model_by_name(&model_name)?
-            .ok_or_else(|| AdminError::NotFound(format!("model '{}' not found", model_name)))?;
-
-        // Remove ALL bindings between this model and the channel (a model
-        // may be bound to the same channel via multiple upstreams under the
-        // triple PK).
-        model_repo.remove_all_bindings_for_channel(model_id, channel_id)?;
-    }
-    // Invalidate cache so the removed binding stops being routed.
-    state.cache.invalidate().await;
-    Ok(Json(serde_json::json!({ "success": true })))
-}
-
 // ======================================================================
 // Small-Model Quota Management
 // ======================================================================
@@ -1630,6 +1578,9 @@ pub struct UpdateSmallModelQuotaRequest {
     pub unit: String,
     /// `'day'` | `'month'` | `'total'`。
     pub window: String,
+    /// 该额度配置对应的上游模型名（从 path param 改为 body 字段，
+    /// 避免 `meta-llama/Llama-3` 等含 `/` 的名字触发 URL 编码问题）。
+    pub upstream_model_name: String,
 }
 
 /// `GET /admin/api/small-models` — list all discovered small models with the
@@ -1645,15 +1596,16 @@ pub async fn list_small_models_handler(
     Ok(Json(repo.list_discovered_models_with_binding_count()?))
 }
 
-/// `PATCH /admin/api/channels/:id/models/:upstream/quota` — configure a
-/// small-model's quota. `:upstream` is the URL-decoded `raw_model_name`.
+/// `PATCH /admin/api/channels/:id/models/quota` — configure a
+/// small-model's quota. `upstream_model_name` is sent in the body to avoid
+/// URL encoding issues with model names containing `/`.
 ///
-/// body: `{ "limit", "unit": "token"|"call", "window": "day"|"month"|"total" }`.
+/// body: `{ "upstream_model_name", "limit", "unit": "token"|"call", "window": "day"|"month"|"total" }`.
 /// `limit = null` means unlimited. Resets `used_quota=0` and
 /// `quota_status='available'`.
 pub async fn update_small_model_quota_handler(
     State(state): State<AppState>,
-    Path((channel_id, upstream)): Path<(i64, String)>,
+    Path(channel_id): Path<i64>,
     Json(payload): Json<UpdateSmallModelQuotaRequest>,
 ) -> AdminResult<Json<()>> {
     if payload.unit != "token" && payload.unit != "call" {
@@ -1673,7 +1625,7 @@ pub async fn update_small_model_quota_handler(
         let repo = DiscoveredModelRepo::new(&db);
         repo.update_discovered_model_quota(
             channel_id,
-            &upstream,
+            &payload.upstream_model_name,
             payload.limit,
             Some(&payload.unit),
             Some(&payload.window),
@@ -1685,31 +1637,44 @@ pub async fn update_small_model_quota_handler(
     Ok(Json(()))
 }
 
-/// `POST /admin/api/channels/:id/models/:upstream/quota/reset` — manually
-/// reset a small-model's used quota. `:upstream` is the URL-decoded
-/// `raw_model_name`. Sets `used_quota=0`, `quota_status='available'`.
+/// `POST /admin/api/channels/:id/models/quota/reset` — manually
+/// reset a small-model's used quota. `upstream_model_name` is sent in the
+/// body to avoid URL encoding issues. Sets `used_quota=0`, `quota_status='available'`.
+#[derive(Debug, Deserialize)]
+pub struct ResetSmallModelQuotaRequest {
+    pub upstream_model_name: String,
+}
+
 pub async fn reset_small_model_quota_handler(
     State(state): State<AppState>,
-    Path((channel_id, upstream)): Path<(i64, String)>,
+    Path(channel_id): Path<i64>,
+    Json(payload): Json<ResetSmallModelQuotaRequest>,
 ) -> AdminResult<Json<serde_json::Value>> {
     {
         let db = state.db.lock().await;
         let repo = DiscoveredModelRepo::new(&db);
-        repo.reset_discovered_model_quota(channel_id, &upstream)?;
+        repo.reset_discovered_model_quota(channel_id, &payload.upstream_model_name)?;
     }
     // Invalidate cache so the reset state takes effect immediately.
     state.cache.invalidate().await;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-/// `DELETE /admin/api/channels/:id/discovered-models/:upstream`
+/// `DELETE /admin/api/channels/:id/discovered-models`
 ///
-/// 从小模型池移除指定发现模型。如果该模型已被大模型绑定
-/// （`binding_count > 0`），返回 409 Conflict 阻止删除——
+/// 从小模型池移除指定发现模型。`upstream_model_name` 在 body 中传递，
+/// 避免 `meta-llama/Llama-3` 等含 `/` 的名字触发 URL 编码问题。
+/// 如果该模型已被大模型绑定（`binding_count > 0`），返回 400 阻止删除——
 /// 调用方应先在 Models 页面解除绑定。
+#[derive(Debug, Deserialize)]
+pub struct DeleteDiscoveredModelRequest {
+    pub upstream_model_name: String,
+}
+
 pub async fn delete_discovered_model_handler(
     State(state): State<AppState>,
-    Path((channel_id, upstream)): Path<(i64, String)>,
+    Path(channel_id): Path<i64>,
+    Json(payload): Json<DeleteDiscoveredModelRequest>,
 ) -> AdminResult<Json<serde_json::Value>> {
     {
         let db = state.db.lock().await;
@@ -1717,7 +1682,7 @@ pub async fn delete_discovered_model_handler(
         // 检查是否已被大模型绑定
         let all = repo.list_discovered_models_with_binding_count()?;
         let target = all.into_iter().find(|d| {
-            d.model.channel_id == channel_id && d.model.raw_model_name == upstream
+            d.model.channel_id == channel_id && d.model.raw_model_name == payload.upstream_model_name
         });
         if let Some(d) = target {
             if d.binding_count > 0 {
@@ -1727,7 +1692,7 @@ pub async fn delete_discovered_model_handler(
                 )));
             }
         }
-        repo.delete_discovered_model(channel_id, &upstream)?;
+        repo.delete_discovered_model(channel_id, &payload.upstream_model_name)?;
     }
     state.cache.invalidate().await;
     Ok(Json(serde_json::json!({ "success": true })))

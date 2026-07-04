@@ -245,7 +245,7 @@ export default function Models() {
     )
     if (!ok) return
     try {
-      await modelApi.removeBinding(m.id, b.channel_id)
+      await modelApi.removeBinding(m.id, b.channel_id, b.upstream_model_name)
       toast({ title: "绑定已解除" })
       refreshAll()
     } catch (err: unknown) {

@@ -125,6 +125,7 @@ export default function Channels() {
   const [savingKey, setSavingKey] = useState(false)
   const [deleteKeyTarget, setDeleteKeyTarget] = useState<KeyConfig | null>(null)
   const [deletingKey, setDeletingKey] = useState(false)
+  const [resettingKey, setResettingKey] = useState<Set<number>>(new Set())
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
 
   // Reload state
@@ -146,8 +147,8 @@ export default function Channels() {
   const [quotaOpen, setQuotaOpen] = useState(false)
   const [quotaChannel, setQuotaChannel] = useState<ChannelConfig | null>(null)
   const [quotaModel, setQuotaModel] = useState<SmallModel | null>(null)
-  const [quotaForm, setQuotaForm] = useState<{ limit: string; unit: QuotaUnit; window: QuotaWindow }>({
-    limit: "", unit: "token", window: "month",
+  const [quotaForm, setQuotaForm] = useState<{ limit: string; unit: QuotaUnit; window: QuotaWindow; unlimited: boolean }>({
+    limit: "", unit: "token", window: "month", unlimited: true,
   })
   const [quotaSaving, setQuotaSaving] = useState(false)
   const [resettingQuota, setResettingQuota] = useState<Set<string>>(new Set())
@@ -314,6 +315,7 @@ export default function Channels() {
       limit: sm.quota_limit != null ? String(sm.quota_limit) : "",
       unit: sm.quota_unit ?? "token",
       window: sm.quota_window ?? "month",
+      unlimited: sm.quota_limit == null,
     })
     setQuotaOpen(true)
   }
@@ -321,6 +323,27 @@ export default function Channels() {
   const handleSaveQuota = async () => {
     if (!quotaChannel || !quotaModel) return
     const upstream = quotaModel.raw_model_name
+    // 无限制模式：直接发 limit: null
+    if (quotaForm.unlimited) {
+      setQuotaSaving(true)
+      try {
+        await modelApi.updateSmallModelQuota(quotaChannel.id, upstream, {
+          limit: null,
+          unit: quotaForm.unit,
+          window: quotaForm.window,
+        })
+        toast({ title: "额度已保存" })
+        setQuotaOpen(false)
+        fetchSmallModels()
+      } catch (err: unknown) {
+        const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || "保存失败"
+        toast({ title: msg, variant: "destructive" })
+      } finally {
+        setQuotaSaving(false)
+      }
+      return
+    }
+    // 有限额度模式：校验数字
     const limitNum = parseInt(quotaForm.limit, 10)
     if (!quotaForm.limit.trim() || isNaN(limitNum) || limitNum <= 0) {
       toast({ title: "请输入有效的额度上限", variant: "destructive" })
@@ -566,6 +589,9 @@ export default function Channels() {
     setReloading(true)
     try {
       await channelApi.reload()
+      // 同步刷新前端 state，避免跨页操作后本地数据陈旧
+      // （例如 Models 页解绑后 smallModelsMap.binding_count 不刷新会导致删除按钮死锁）
+      await Promise.all([fetchChannels(), fetchSmallModels()])
       toast({ title: "缓存已刷新" })
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || "刷新失败"
@@ -673,6 +699,24 @@ export default function Channels() {
       toast({ title: msg, variant: "destructive" })
     } finally {
       setDeletingKey(false)
+    }
+  }
+
+  const handleResetKeyQuota = async (channelId: number, key: KeyConfig) => {
+    setResettingKey(prev => new Set(prev).add(key.id))
+    try {
+      await channelApi.resetKeyQuota(channelId, key.id)
+      toast({ title: "Key 用量已重置" })
+      await refreshKeys(channelId)
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || "重置失败"
+      toast({ title: msg, variant: "destructive" })
+    } finally {
+      setResettingKey(prev => {
+        const next = new Set(prev)
+        next.delete(key.id)
+        return next
+      })
     }
   }
 
@@ -1095,6 +1139,17 @@ export default function Channels() {
                               <Button variant="ghost" size="icon" onClick={() => openEditKey(k)} title="编辑">
                                 <Pencil className="h-4 w-4" />
                               </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                onClick={() => handleResetKeyQuota(keyChannel!.id, k)}
+                                disabled={resettingKey.has(k.id)}
+                                title="重置用量"
+                              >
+                                {resettingKey.has(k.id)
+                                  ? <Loader2 className="h-4 w-4 animate-spin" />
+                                  : <RefreshCw className="h-4 w-4" />}
+                              </Button>
                               <Button variant="ghost" size="icon" onClick={() => setDeleteKeyTarget(k)} title="删除">
                                 <Trash2 className="h-4 w-4 text-destructive" />
                               </Button>
@@ -1250,7 +1305,16 @@ export default function Channels() {
               )
             })()}
             <div className="space-y-2">
-              <Label htmlFor="quota-limit">额度上限</Label>
+              <div className="flex items-center justify-between">
+                <Label htmlFor="quota-limit">额度上限</Label>
+                <div className="flex items-center gap-2">
+                  <Switch
+                    checked={quotaForm.unlimited}
+                    onCheckedChange={(v) => setQuotaForm(f => ({ ...f, unlimited: v }))}
+                  />
+                  <span className="text-xs text-muted-foreground">无限制</span>
+                </div>
+              </div>
               <Input
                 id="quota-limit"
                 type="number"
@@ -1258,6 +1322,7 @@ export default function Channels() {
                 value={quotaForm.limit}
                 onChange={(e) => setQuotaForm(f => ({ ...f, limit: e.target.value }))}
                 placeholder="如 1000000"
+                disabled={quotaForm.unlimited}
               />
             </div>
             <div className="grid grid-cols-2 gap-4">

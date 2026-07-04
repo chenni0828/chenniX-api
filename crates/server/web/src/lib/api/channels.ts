@@ -32,6 +32,7 @@ export interface CreateChannelData {
 
 export interface CreateKeyData {
   api_key: string
+  label?: string | null
   is_free: boolean
   priority: number
   quota_limit: number
@@ -47,6 +48,7 @@ export interface ChannelModel {
   canonical_name: string
   upstream_model_name?: string | null
   priority: number
+  weight?: number
   pricing?: ChannelModelPricing
 }
 export interface ChannelTestResult {
@@ -68,6 +70,8 @@ export const channelApi = {
   createKey: (channelId: number, data: CreateKeyData) => api.post<number>(`/channels/${channelId}/keys`, data).then((r) => r.data),
   updateKey: (channelId: number, keyId: number, data: UpdateKeyData) => api.put(`/channels/${channelId}/keys/${keyId}`, data).then((r) => r.data),
   deleteKey: (channelId: number, keyId: number) => api.delete(`/channels/${channelId}/keys/${keyId}`).then((r) => r.data),
+  resetKeyQuota: (channelId: number, keyId: number) =>
+    api.post(`/channels/${channelId}/keys/${keyId}/reset-quota`).then((r) => r.data),
   reload: () => api.post("/reload").then((r) => r.data),
   testChannel: (channelId: number) => api.post<ChannelTestResult>(`/channels/${channelId}/test`).then((r) => r.data),
   getModels: (channelId: number) => api.get<ChannelModel[]>(`/channels/${channelId}/models`).then((r) => r.data),
@@ -84,12 +88,7 @@ export const channelApi = {
     api.post<{ added: number }>(`/channels/${channelId}/discovered-models`, { models }).then((r) => r.data),
   /** 从小模型池移除指定发现模型 (binding_count>0 时后端会拒绝) */
   deleteDiscoveredModel: (channelId: number, upstreamModelName: string) =>
-    api.delete(`/channels/${channelId}/discovered-models/${encodeURIComponent(upstreamModelName)}`).then((r) => r.data),
-  addChannelModel: (channelId: number, modelName: string, upstreamModelName?: string) =>
-    api.post(`/channels/${channelId}/models`, {
-      model_name: modelName,
-      upstream_model_name: upstreamModelName || modelName,
+    api.delete(`/channels/${channelId}/discovered-models`, {
+      data: { upstream_model_name: upstreamModelName },
     }).then((r) => r.data),
-  removeChannelModel: (channelId: number, modelName: string) =>
-    api.delete(`/channels/${channelId}/models/${encodeURIComponent(modelName)}`).then((r) => r.data),
 }
