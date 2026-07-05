@@ -134,7 +134,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::new(config),
         session_store,
         active_streams: Arc::new(AtomicUsize::new(0)),
-        http_client,
     };
 
     // 9. Spawn background health-recovery loop

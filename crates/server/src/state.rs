@@ -34,8 +34,6 @@ pub struct AppState {
     /// spawned via `tokio::spawn`). Used during graceful shutdown to wait
     /// for all streaming billing to complete before the process exits.
     pub active_streams: Arc<AtomicUsize>,
-    /// 共享的 HTTP Client（连接池复用）。所有上游请求都通过这个 Client 发送。
-    pub http_client: reqwest::Client,
 }
 
 impl AppState {
