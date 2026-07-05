@@ -24,7 +24,7 @@ RUN npm run build
 # ============================================================================
 # Stage 2: 后端构建（rust）
 # ============================================================================
-FROM rust:1.82-bookworm AS backend-builder
+FROM rust:1-bookworm-slim AS backend-builder
 
 WORKDIR /app
 
@@ -42,6 +42,9 @@ COPY crates/ ./crates/
 
 # 将前端构建产物复制到 rust-embed 读取的目录
 COPY --from=web-builder /app/web/../static ./crates/server/static
+
+# 诊断：确认前端产物存在（rust-embed 编译期需要 static/ 目录）
+RUN ls -la crates/server/static/ | head -20
 
 # Release 模式构建
 RUN cargo build --release --bin chennix-api
