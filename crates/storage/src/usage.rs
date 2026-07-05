@@ -297,8 +297,8 @@ impl<'a> UsageRepo<'a> {
             .prepare(
                 "SELECT id, request_id, client_ip, method, path, client_model,
                         normalized_model, channel_name, key_label, upstream_status,
-                        response_status, duration_ms, stream, user_id, token_id,
-                        quota_cost, error_message, created_at
+                        upstream_model, response_status, duration_ms, stream,
+                        user_id, token_id, quota_cost, error_message, created_at
                  FROM request_logs
                  ORDER BY id DESC
                  LIMIT ?1",
