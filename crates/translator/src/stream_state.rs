@@ -22,6 +22,8 @@ pub struct OpenaiToClaudeStreamState {
     pub started: bool,
     pub deferred_usage: Option<Usage>,
     pub current_tool_id: Option<String>,
+    /// 当前 Claude content block 类型：None / "text" / "thinking" / "tool_use"
+    pub current_block_type: Option<String>,
     // internal bookkeeping
     current_oai_tool_index: i32,
     message_id: String,
@@ -45,6 +47,7 @@ impl OpenaiToClaudeStreamState {
             started: false,
             deferred_usage: None,
             current_tool_id: None,
+            current_block_type: None,
             current_oai_tool_index: -1,
             message_id: String::new(),
             model: String::new(),
@@ -130,10 +133,11 @@ impl OpenaiToClaudeStreamState {
             }
         };
 
-        // On the very first chunk, emit message_start + content_block_start (text, index 0).
+        // On the very first chunk, emit message_start only.
+        // content_block_start 延迟到看到实际 delta 内容（text / reasoning_content / tool_calls）时再发，
+        // 以支持首个内容是思考过程的场景（如 o1/o3 模型）。
         if !self.started {
             out.push(self.make_message_start());
-            out.push(Self::make_content_block_start_text(0));
             self.started = true;
             self.content_block_index = 0;
         }
@@ -145,6 +149,26 @@ impl OpenaiToClaudeStreamState {
 
         let delta = choice.get("delta").unwrap_or(&Value::Null);
 
+        // Process reasoning_content → thinking block + thinking_delta
+        // 兼容 reasoning_content 和 reasoning 两种字段名（对齐 new-api GetReasoningContent）
+        if let Some(reasoning) = delta
+            .get("reasoning_content")
+            .and_then(|r| r.as_str())
+            .or_else(|| delta.get("reasoning").and_then(|r| r.as_str()))
+        {
+            if !reasoning.is_empty() {
+                // 确保当前是 thinking block（必要时关闭前一个 block 并开新 thinking block）
+                if self.current_block_type.as_deref() != Some("thinking") {
+                    if let Some(b) = self.close_current_block() {
+                        out.push(b);
+                    }
+                    out.push(Self::make_content_block_start_thinking(self.content_block_index));
+                    self.current_block_type = Some("thinking".to_string());
+                }
+                out.push(Self::make_thinking_delta(self.content_block_index, reasoning));
+            }
+        }
+
         // Process tool_calls deltas
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tool_calls {
@@ -153,8 +177,10 @@ impl OpenaiToClaudeStreamState {
 
                 // A new tool call (different OpenAI index) → close current block, open tool_use
                 if tc_index != self.current_oai_tool_index {
-                    out.push(Self::make_content_block_stop(self.content_block_index));
-                    self.content_block_index += 1;
+                    // 关闭当前 block（text / thinking / 之前的 tool_use）
+                    if let Some(b) = self.close_current_block() {
+                        out.push(b);
+                    }
 
                     let id = tc_id.clone().unwrap_or_default();
                     let name = tc
@@ -172,6 +198,7 @@ impl OpenaiToClaudeStreamState {
                     self.current_oai_tool_index = tc_index;
                     self.current_tool_id = Some(id);
                     self.tool_call_index += 1;
+                    self.current_block_type = Some("tool_use".to_string());
                 }
 
                 // Emit arguments as input_json_delta (skip empty fragments)
@@ -190,6 +217,14 @@ impl OpenaiToClaudeStreamState {
         // Process text content
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             if !content.is_empty() {
+                // 确保当前是 text block（必要时关闭 thinking block 并开新 text block）
+                if self.current_block_type.as_deref() != Some("text") {
+                    if let Some(b) = self.close_current_block() {
+                        out.push(b);
+                    }
+                    out.push(Self::make_content_block_start_text(self.content_block_index));
+                    self.current_block_type = Some("text".to_string());
+                }
                 out.push(Self::make_text_delta(self.content_block_index, content));
             }
         }
@@ -199,8 +234,10 @@ impl OpenaiToClaudeStreamState {
         // finish_reason 到达时只关闭 content_block，延迟发 message_delta/message_stop，
         // 等后续 usage-only chunk 到达后再补发（OpenAI 的 usage 常在 finish 之后的独立 chunk）。
         if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-            // Close the current content block
-            out.push(Self::make_content_block_stop(self.content_block_index));
+            // Close the current content block (if any)
+            if let Some(b) = self.close_current_block() {
+                out.push(b);
+            }
 
             let stop_reason = match fr {
                 "stop" => "end_turn",
@@ -226,6 +263,19 @@ impl OpenaiToClaudeStreamState {
         }
 
         Ok(out)
+    }
+
+    /// 关闭当前 content block（如果有），返回 content_block_stop 事件并推进 index。
+    /// 若当前没有打开的 block，返回 None。
+    fn close_current_block(&mut self) -> Option<Bytes> {
+        if self.current_block_type.is_some() {
+            let stop = Self::make_content_block_stop(self.content_block_index);
+            self.content_block_index += 1;
+            self.current_block_type = None;
+            Some(stop)
+        } else {
+            None
+        }
     }
 
     // ---- Claude SSE event constructors ----
@@ -269,6 +319,17 @@ impl OpenaiToClaudeStreamState {
         )
     }
 
+    fn make_content_block_start_thinking(index: i32) -> Bytes {
+        Self::make_event(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+        )
+    }
+
     fn make_text_delta(index: i32, text: &str) -> Bytes {
         Self::make_event(
             "content_block_delta",
@@ -276,6 +337,17 @@ impl OpenaiToClaudeStreamState {
                 "type": "content_block_delta",
                 "index": index,
                 "delta": {"type": "text_delta", "text": text}
+            }),
+        )
+    }
+
+    fn make_thinking_delta(index: i32, thinking: &str) -> Bytes {
+        Self::make_event(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "thinking_delta", "thinking": thinking}
             }),
         )
     }
@@ -441,6 +513,19 @@ impl ClaudeToOpenaiStreamState {
                     }
                     let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("");
                     out.push(self.make_content_chunk(text));
+                } else if delta_type == "thinking_delta" {
+                    // 思考内容 → delta.reasoning_content
+                    if !self.started {
+                        out.push(self.make_role_chunk());
+                        self.started = true;
+                    }
+                    if let Some(t) = delta.get("thinking").and_then(|t| t.as_str()) {
+                        if !t.is_empty() {
+                            out.push(self.make_reasoning_chunk(t));
+                        }
+                    }
+                } else if delta_type == "signature_delta" {
+                    // 加密签名不透传，忽略
                 } else if delta_type == "input_json_delta" {
                     let partial = delta
                         .get("partial_json")
@@ -524,6 +609,16 @@ impl ClaudeToOpenaiStreamState {
             "created": self.created,
             "model": self.model,
             "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+        }))
+    }
+
+    fn make_reasoning_chunk(&self, text: &str) -> Bytes {
+        Self::make_chunk(&json!({
+            "id": self.message_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
         }))
     }
 

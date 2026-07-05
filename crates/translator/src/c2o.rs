@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 ///   `role=tool` messages (one per tool_result block), with `tool_call_id` and `content`
 /// - `tools[].input_schema` → `tools[].function.parameters`
 /// - `disable_parallel_tool_use` → `parallel_tool_calls` (boolean inverted)
-/// - `thinking.budget_tokens` → `reasoning_effort` (<20000→"low", <40000→"medium", else→"high")
+/// - `thinking.budget_tokens` → `reasoning_effort` (<1700→"low", <3000→"medium", else→"high")
 /// - `max_tokens`, `temperature`, `top_p`, `model`, `stream` — pass through
 pub fn claude_to_openai_request(body: &Value) -> ProxyResult<Value> {
     let mut out = serde_json::Map::new();
@@ -220,14 +220,15 @@ pub fn claude_to_openai_request(body: &Value) -> ProxyResult<Value> {
     }
 
     // 8. thinking.budget_tokens → reasoning_effort (approximate)
+    // 阈值与 o2c.rs 正向映射对齐：1280→low, 2048→medium, 4096→high
     if let Some(budget) = body
         .get("thinking")
         .and_then(|t| t.get("budget_tokens"))
         .and_then(|b| b.as_u64())
     {
-        let effort = if budget < 20000 {
+        let effort = if budget < 1700 {
             "low"
-        } else if budget < 40000 {
+        } else if budget < 3000 {
             "medium"
         } else {
             "high"
@@ -241,6 +242,8 @@ pub fn claude_to_openai_request(body: &Value) -> ProxyResult<Value> {
 /// Convert an OpenAI `/v1/chat/completions` response back to Claude `/v1/messages` format.
 ///
 /// Key transformations:
+/// - `choices[0].message.reasoning_content` → `content: [{type:"thinking", thinking:"..."}]`
+///   (兼容 reasoning 字段；放在 text block 之前)
 /// - `choices[0].message.content` (string) → `content: [{type:"text", text:"..."}]`
 /// - `choices[0].message.tool_calls` → `content: [..., {type:"tool_use", id, name, input}]`
 ///   (`arguments` JSON string is parsed into `input` object)
@@ -260,6 +263,17 @@ pub fn openai_to_claude_response(body: &Value) -> ProxyResult<Value> {
     if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
         if let Some(choice) = choices.first() {
             if let Some(message) = choice.get("message") {
+                // Reasoning content → thinking block（兼容 reasoning_content 和 reasoning 字段）
+                // 放在 text block 之前，与 Claude 响应顺序一致（先思考后回答）
+                let reasoning = message
+                    .get("reasoning_content")
+                    .and_then(|r| r.as_str())
+                    .or_else(|| message.get("reasoning").and_then(|r| r.as_str()));
+                if let Some(r) = reasoning {
+                    if !r.is_empty() {
+                        content.push(json!({"type": "thinking", "thinking": r}));
+                    }
+                }
                 // Text content → text block
                 if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
                     if !text.is_empty() {
@@ -440,12 +454,14 @@ mod tests {
     #[test]
     fn test_thinking_budget_tokens_to_reasoning_effort() {
         let cases = [
-            (10000u64, "low"),
-            (19999, "low"),
-            (20000, "medium"),
-            (39999, "medium"),
-            (40000, "high"),
-            (64000, "high"),
+            (1000u64, "low"),
+            (1280, "low"),
+            (1699, "low"),
+            (1700, "medium"),
+            (2048, "medium"),
+            (2999, "medium"),
+            (3000, "high"),
+            (4096, "high"),
         ];
         for (budget, expected) in cases {
             let input = json!({

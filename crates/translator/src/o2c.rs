@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 /// - `tools[].function` → `tools[].input_schema`
 /// - `parallel_tool_calls` → `disable_parallel_tool_use` (boolean inverted)
 /// - `response_format` → append instruction to system prompt
-/// - `reasoning_effort` → `thinking: {type:"enabled", budget_tokens: N}`
+/// - `reasoning_effort` → `thinking: {type:"enabled", budget_tokens: N}` (low=1280, medium=2048, high=4096)
 /// - `max_tokens` defaults to 4096 if missing
 /// - Drops `stream`, `n`, `presence_penalty`, `frequency_penalty`, `logprobs`, `top_logprobs`
 pub fn openai_to_claude_request(body: &Value) -> ProxyResult<Value> {
@@ -219,12 +219,13 @@ pub fn openai_to_claude_request(body: &Value) -> ProxyResult<Value> {
     }
 
     // 11. reasoning_effort → thinking.budget_tokens
+    // 数值对齐 new-api：low=1280, medium=2048, high=4096（思考预算 token 上限）
     if let Some(effort) = body.get("reasoning_effort").and_then(|e| e.as_str()) {
         let budget: u64 = match effort {
-            "low" => 16000,
-            "medium" => 32000,
-            "high" => 64000,
-            _ => 32000,
+            "low" => 1280,
+            "medium" => 2048,
+            "high" => 4096,
+            _ => 2048,
         };
         out.insert(
             "thinking".to_string(),
@@ -242,6 +243,7 @@ pub fn openai_to_claude_request(body: &Value) -> ProxyResult<Value> {
 ///
 /// Key transformations:
 /// - `content[]` text blocks → `choices[0].message.content` (concatenated string)
+/// - `content[].type=thinking` → `choices[0].message.reasoning_content` (明文思考内容，signature 忽略)
 /// - `content[].type=tool_use` → `choices[0].message.tool_calls` (arguments is JSON string)
 /// - `stop_reason` → `finish_reason`: end_turn→stop, tool_use→tool_calls,
 ///   max_tokens→length, stop_sequence→stop
@@ -256,6 +258,7 @@ pub fn claude_to_openai_response(body: &Value) -> ProxyResult<Value> {
     // Build message: concatenate text blocks into content string, collect tool_use blocks
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
 
     if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
         for block in content {
@@ -263,6 +266,12 @@ pub fn claude_to_openai_response(body: &Value) -> ProxyResult<Value> {
                 "text" => {
                     if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
                         text_parts.push(t.to_string());
+                    }
+                }
+                "thinking" => {
+                    // 明文思考内容 → reasoning_content；加密的 signature 忽略
+                    if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
+                        reasoning_parts.push(t.to_string());
                     }
                 }
                 "tool_use" => {
@@ -286,6 +295,7 @@ pub fn claude_to_openai_response(body: &Value) -> ProxyResult<Value> {
     }
 
     let content_str = text_parts.join("");
+    let reasoning_str = reasoning_parts.join("");
 
     // stop_reason → finish_reason
     let stop_reason = body.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("");
@@ -314,6 +324,9 @@ pub fn claude_to_openai_response(body: &Value) -> ProxyResult<Value> {
     let mut message = serde_json::Map::new();
     message.insert("role".to_string(), json!("assistant"));
     message.insert("content".to_string(), json!(content_str));
+    if !reasoning_str.is_empty() {
+        message.insert("reasoning_content".to_string(), json!(reasoning_str));
+    }
     if !tool_calls.is_empty() {
         message.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
@@ -570,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_effort_to_thinking() {
-        let cases = [("low", 16000u64), ("medium", 32000), ("high", 64000)];
+        let cases = [("low", 1280u64), ("medium", 2048), ("high", 4096)];
         for (effort, budget) in cases {
             let input = json!({
                 "model": "gpt-4",
