@@ -140,7 +140,6 @@ mod tests {
             active_streams: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             config,
             session_store: crate::admin::new_session_store(),
-            http_client,
         }
     }
 

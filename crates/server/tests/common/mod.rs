@@ -255,7 +255,6 @@ fn create_test_app(db: SharedDb) -> (Router, AppState) {
         config,
         session_store: chennix_server::admin::new_session_store(),
         active_streams: Arc::new(AtomicUsize::new(0)),
-        http_client,
     };
 
     let app = build_test_router(state.clone());

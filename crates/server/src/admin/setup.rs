@@ -147,7 +147,6 @@ mod tests {
             }),
             session_store: crate::admin::auth::new_session_store(),
             active_streams: Arc::new(AtomicUsize::new(0)),
-            http_client,
         }
     }
 

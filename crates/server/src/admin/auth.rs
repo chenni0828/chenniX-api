@@ -369,7 +369,6 @@ mod tests {
             }),
             session_store: new_session_store(),
             active_streams: Arc::new(AtomicUsize::new(0)),
-            http_client,
         }
     }
 
