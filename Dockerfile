@@ -24,7 +24,7 @@ RUN npm run build
 # ============================================================================
 # Stage 2: 后端构建（rust）
 # ============================================================================
-FROM rust:1-bookworm-slim AS backend-builder
+FROM rust:1 AS backend-builder
 
 WORKDIR /app
 
