@@ -28,8 +28,11 @@ FROM rust:1.82-bookworm AS backend-builder
 
 WORKDIR /app
 
-# 安装后端构建依赖（rusqlite-bundled 需要 cc）
+# 安装后端构建依赖
+# - gcc: rusqlite bundled feature 从源码编译 SQLite，需要 C 编译器
+# - pkg-config: 查找系统库
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
