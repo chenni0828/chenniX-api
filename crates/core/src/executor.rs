@@ -478,13 +478,14 @@ impl Executor {
     ) -> ProxyResult<Vec<Vec<RoutedKey>>> {
         // NOTE: do NOT call `check_recoveries()` here.
         //
-        // `is_available` already checks `cooldown_until > Utc::now()` inline,
-        // so cooldown recovery happens lazily per-key without the O(N) write
-        // lock traversal `check_recoveries` would require. Background task in
-        // main.rs runs `check_recoveries` every 10s to reset
-        // `consecutive_failures` (which only affects backoff window length)
-        // and to roll over small-model quota windows — neither is on the
-        // hot path.
+        // `is_available` already checks per-(key, upstream_model)
+        // `cooldown_until > Utc::now()` inline, so cooldown recovery happens
+        // lazily without the O(N) write lock traversal `check_recoveries`
+        // would require. Background task in main.rs runs
+        // `check_recoveries` every 10s to drop expired per-model cooldown
+        // entries (memory hygiene + reset `consecutive_failures` so the next
+        // failure starts a fresh backoff window) and to roll over small-model
+        // quota windows — neither is on the hot path.
         //
         // 对齐 new-api relay.go：恢复由后台任务触发，不在每请求路径跑
         // 全量写锁遍历，避免高并发下的锁竞争 + O(N) 遍历 + DB 写放大。
@@ -502,12 +503,12 @@ impl Executor {
         let routed = Router::route(
             tuples,
             &ctx.user_group,
-            move |key_id| {
-                // Synchronous availability check. Uses try_read on the
-                // HealthManager's internal RwLock — if contended, returns
-                // true (optimistic) and the per-key async check in the
-                // executor loop re-validates.
-                health_for_keys.try_is_available(key_id)
+            move |key_id, upstream_model| {
+                // Synchronous availability check (per-(key, upstream_model)).
+                // Uses try_read on the HealthManager's internal RwLock — if
+                // contended, returns true (optimistic) and the per-key async
+                // check in the executor loop re-validates.
+                health_for_keys.try_is_available(key_id, upstream_model)
             },
             strategy,
             // Small-model quota filter: drop bindings whose
@@ -582,7 +583,7 @@ impl Executor {
         for binding in candidates.iter().take(MAX_BINDING_ATTEMPTS) {
             for rk in binding {
             // Re-check availability (async, authoritative).
-            if !self.health.is_available(rk.key.id).await {
+            if !self.health.is_available(rk.key.id, &rk.upstream_model_name).await {
                 continue;
             }
 
@@ -649,7 +650,7 @@ impl Executor {
                         &timeout_err.to_string(),
                     )
                     .await;
-                    self.health.mark_cooldown(rk.key.id).await;
+                    self.health.mark_cooldown(rk.key.id, &rk.upstream_model_name).await;
                     continue;
                 }
             };
@@ -803,7 +804,7 @@ impl Executor {
                             continue;
                         }
                         FailureAction::Cooldown => {
-                            self.health.mark_cooldown(rk.key.id).await;
+                            self.health.mark_cooldown(rk.key.id, &rk.upstream_model_name).await;
                             continue;
                         }
                         FailureAction::SkipBinding => {
@@ -913,7 +914,7 @@ impl Executor {
 
         for binding in candidates.iter().take(MAX_BINDING_ATTEMPTS) {
             for rk in binding {
-            if !self.health.is_available(rk.key.id).await {
+            if !self.health.is_available(rk.key.id, &rk.upstream_model_name).await {
                 continue;
             }
 
@@ -980,7 +981,7 @@ impl Executor {
                         &timeout_err.to_string(),
                     )
                     .await;
-                    self.health.mark_cooldown(rk.key.id).await;
+                    self.health.mark_cooldown(rk.key.id, &rk.upstream_model_name).await;
                     continue;
                 }
             };
@@ -1076,7 +1077,7 @@ impl Executor {
                             continue;
                         }
                         FailureAction::Cooldown => {
-                            self.health.mark_cooldown(rk.key.id).await;
+                            self.health.mark_cooldown(rk.key.id, &rk.upstream_model_name).await;
                             continue;
                         }
                         FailureAction::SkipBinding => {
@@ -1637,8 +1638,8 @@ mod tests {
         let loader = loader_with_two_keys();
         let ctx = ctx(7);
 
-        // Mark key 11 (would be first) as cooldown.
-        exec.health.mark_cooldown(11).await;
+        // Mark key 11 (would be first) as cooldown on its upstream model "up-b".
+        exec.health.mark_cooldown(11, "up-b").await;
         let groups = exec.select_keys(&ctx, &loader).await.unwrap();
         // key 11 不可用 → ch2/up-b binding 整个被丢弃（无可用 key），仅剩 ch1/up-a binding
         assert_eq!(groups.len(), 1); // 1 binding
@@ -1741,15 +1742,28 @@ mod tests {
             other => panic!("expected AllKeysExhausted, got {:?}", other),
         }
 
-        // Both keys should now be in Cooldown (or Disabled — but our
-        // network error path uses Cooldown).
-        for id in [10, 11] {
+        // Both keys should now have a per-(key, upstream_model) cooldown
+        // entry. key 10 failed on "up-a", key 11 failed on "up-b".
+        // key.status remains Active — cooldown is per-(key, model), not
+        // per-key.
+        for (id, upstream) in [(10, "up-a"), (11, "up-b")] {
             let s = exec.health.get_state(id).await.expect("state must exist");
-            assert!(
-                s.status == KeyStatus::Cooldown,
-                "key {} should be in Cooldown, got {:?}",
+            assert_eq!(
+                s.status,
+                KeyStatus::Active,
+                "key {} status should remain Active (cooldown is per-model), got {:?}",
                 id,
                 s.status
+            );
+            let entry = s
+                .cooldowns
+                .get(upstream)
+                .unwrap_or_else(|| panic!("key {} should have cooldown entry for {}", id, upstream));
+            assert!(
+                entry.cooldown_until.is_some(),
+                "key {} cooldown for {} should have a window",
+                id,
+                upstream
             );
         }
     }

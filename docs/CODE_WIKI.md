@@ -226,7 +226,7 @@ pub fn open_db(path: &str) -> ProxyResult<Connection>
 | `users` | 用户（username 唯一，bcrypt 密码，role/status/quota/used_quota/group） |
 | `tokens` | 用户的 API Key（key 唯一，remain_quota/used_quota/unlimited_quota/expired_time/model_limits/allow_ips/status），索引 `idx_tokens_user`、`idx_tokens_key` |
 | `channels` | 渠道（name 唯一，provider/base_url/priority/group） |
-| `channel_keys` | 渠道 Key（cost_tier/key_priority/price/free_quota/used_quota/quota_reset_period/status/cooldown_until/consecutive_failures），索引 `idx_channel_keys_channel` |
+| `channel_keys` | 渠道 Key（cost_tier/key_priority/price/free_quota/used_quota/quota_reset_period/status；`cooldown_until`/`consecutive_failures` 列已废弃——cooldown 现为 per-(key, upstream_model) 内存态，不再持久化），索引 `idx_channel_keys_channel` |
 | `discovered_models` | 上游发现的原始模型（channel_id+raw_model_name 唯一，status=unmerged/merged，is_free/source/metadata） |
 | `model_channels` | 模型-渠道多对多绑定（联合主键，含 upstream_model_name） |
 | `usage_logs` | 用量记录（精确到 user/token/channel/key/model 级别，含 quota_cost） |
@@ -395,21 +395,27 @@ pub fn route(channels: Vec<(ChannelConfig, Vec<KeyConfig>, String)>, user_group:
 ### 9.3 HealthManager — [health.rs](file:///c:/Users/chenniX/Desktop/chenniX-api/crates/core/src/health.rs)
 Key 运行时健康状态管理，`Arc<RwLock<HashMap<i64, KeyRuntimeState>>>` + 可选 `SharedDb` 持久化。
 
+Cooldown 粒度为 **per-(key_id, upstream_model_name)**：同一 Key 在一个上游模型上超时/限流，不影响它服务其他上游模型。`status` 仅记录持久状态（Active/Disabled），瞬态 cooldown 存于 `cooldowns` map。
+
 ```rust
-pub struct KeyRuntimeState {
-    pub key_id: i64,
-    pub status: KeyStatus,
+pub struct CooldownEntry {
     pub cooldown_until: Option<DateTime<Utc>>,
     pub consecutive_failures: u32,
+}
+
+pub struct KeyRuntimeState {
+    pub key_id: i64,
+    pub status: KeyStatus,                              // Active / Disabled
+    pub cooldowns: HashMap<String, CooldownEntry>,      // key = upstream_model_name
     pub used_quota_this_period: u64,
 }
 ```
 
 关键方法：
-- `is_available(key_id)` / `try_is_available(key_id)`（同步版，锁争用时乐观返回 true）
-- `mark_cooldown(key_id)` — 指数退避 `2^n` 秒，上限 1800s（30min）；**仅在内存**，不实时写 DB
-- `mark_disabled(key_id)` — 内存 + 立即写 DB（重启后保持 disabled）
-- `check_recoveries()` — 清除过期 cooldown，恢复为 Active 并持久化
+- `is_available(key_id, upstream_model)` / `try_is_available(key_id, upstream_model)`（同步版，锁争用时乐观返回 true）
+- `mark_cooldown(key_id, upstream_model)` — 指数退避 `2^n` 秒，上限 1800s（30min）；**仅在内存**，不实时写 DB；**不改 key.status**（保持 Active，仅冷却该 (key, model) 组合）
+- `mark_disabled(key_id)` — 内存 + 立即写 DB（重启后保持 disabled）；清空所有 per-model cooldown
+- `check_recoveries()` — 清理过期的 per-model cooldown 条目（内存回收 + 重置退避计数器）；**不写 DB**（cooldown 从不持久化）
 - `restore_disabled(key_ids)` — 手动恢复 disabled Key
 - `add_usage(key_id, tokens)` — 累加内存计数（路由排序用）
 - `sync_key_from_db(key_id, status)` — 管理 API 改状态后同步内存
@@ -489,7 +495,7 @@ pub struct Executor { pub health: Arc<HealthManager>, pub cache: Arc<ConfigCache
 
 **关键函数**：
 
-- `select_keys(ctx, loader)` — `check_recoveries()` → `cache.get_for_model()` → `Router::route()`，返回排序后的候选 Key。
+- `select_keys(ctx, loader)` — `cache.get_for_model()` → `Router::route()`（传入 per-(key, model) 可用性闭包），返回排序后的候选 Key。**不调 `check_recoveries`**（后台 10s 跑一次；`is_available` 内联检查 cooldown_until 实现零延迟恢复）。
 - `classify_failure(e) -> FailureAction` — 三档分类：invalid_request→`ReturnToClient`，fatal(401/403)→`Disable`，其他→`Cooldown`。
 - `estimate_cost(key, model_pricing)` — 预扣估算（按 1000 token 估算，优先 key 级价格，其次 model 定价，无定价则 0=免费）。
 - `actual_cost(usage, key, model_pricing)` — 实际成本计算。
@@ -499,7 +505,7 @@ pub struct Executor { pub health: Arc<HealthManager>, pub cache: Arc<ConfigCache
 **非流式 `execute(...)`** 流程：
 1. `select_keys` 取候选；空则返回 `AllKeysExhausted`。
 2. `BillingManager::pre_charge`（按第一个候选估算）。
-3. 遍历候选：`is_available` → `prepare_request` → `adaptor.execute` → 成功则提取 usage、`settle`、`track_success`、（跨格式则 `translate_response_back`）返回；失败按 `classify_failure` 处理（Disable/Cooldown 继续，ReturnToClient 退款返回）。
+3. 遍历候选：`is_available(key_id, upstream_model)` → `prepare_request` → `adaptor.execute` → 成功则提取 usage、`settle`、`track_success`、（跨格式则 `translate_response_back`）返回；失败按 `classify_failure` 处理（Disable/Cooldown 继续，ReturnToClient 退款返回；Cooldown 调 `mark_cooldown(key_id, upstream_model)` 只冷却该组合）。
 4. 全部失败：退款 + `AllKeysExhausted`。
 
 **流式 `execute_stream(...)`** 流程：与非流式相同到 adaptor 调用，返回 `StreamBootstrap { response, session, routed_key, model_pricing, entry_format, adaptor_provider }`。**bootstrap 边界**：adaptor 返回 `Ok(resp)` 即已连上上游、不可再切 Key；后续逐 chunk 转发、usage 提取、billing settle、track 由 HTTP handler（`stream_sse_response`）完成。
@@ -634,14 +640,14 @@ React 19 + TypeScript + Vite 6 + Tailwind 4（`@tailwindcss/vite`）+ shadcn/ui 
 4. Normalizer.resolve("deepseek-chat") → (model_id=7, "deepseek-v3")  // 别名归一化
 5. 校验 token.allows_model("deepseek-v3")
 6. Executor.execute(ctx, EntryFormat::OpenAI, body):
-   a. select_keys: check_recoveries → cache.get_for_model(7) → Router::route
+   a. select_keys: cache.get_for_model(7) → Router::route
       → 排序后 [key2(free), key1(paid)]
    b. BillingManager.pre_charge(user, token, estimate)  // 双层扣
    c. 遍历候选:
-      key2: is_available → prepare_request(同格式, 替换 model 为 upstream_name)
+      key2: is_available(key2, upstream_model) → prepare_request(同格式, 替换 model 为 upstream_name)
             → OpenaiAdaptor.execute(base_url, api_key, body) → Ok(bytes)
             → extract_usage → actual_cost → settle → track_success → 返回
-      (失败 429: mark_cooldown(key2) → 试 key1)
+      (失败 429: mark_cooldown(key2, upstream_model) → 试 key1)
 7. 返回 JSON 给客户端
 ```
 
@@ -685,17 +691,18 @@ React 19 + TypeScript + Vite 6 + Tailwind 4（`@tailwindcss/vite`）+ shadcn/ui 
 
 | 分类 | 触发 | 处理 |
 |------|------|------|
-| retryable | 429 / 5xx / 网络错误 | mark_cooldown 该 Key，试下一 Key |
+| retryable | 429 / 5xx / 网络错误 | mark_cooldown 该 (key, upstream_model) 组合，试下一候选；**不影响同 Key 的其他模型** |
 | fatal | 401 / 403（Key 无效） | mark_disabled 该 Key（内存+DB），继续试其他 Key |
 | invalid_request | 400 / 422 / InvalidRequest | **立即返回客户端**，退款，不重试不标记 Key |
 | 流式中途错误 | 已发 chunk 后出错 | 无法切渠道，发 SSE 错误事件终止流 |
 
 ### 冷却退避
 
-- 指数退避：`2^n` 秒（n=连续失败次数），上限 1800s（30min）。
-- 冷却状态**仅在内存**，不实时写 DB；冷却超时自动恢复（`check_recoveries`）。
+- 指数退避：`2^n` 秒（n=该 (key, upstream_model) 组合的连续失败次数），上限 1800s（30min）。
+- 冷却粒度为 **per-(key_id, upstream_model_name)**：同一 Key 在模型 A 上限流，仍可服务模型 B。
+- 冷却状态**仅在内存**（`cooldowns` map），不实时写 DB；冷却超时自动恢复（`check_recoveries` 清理过期条目）。
 - `disabled` 立即写 DB（重启保持）；启动时 `load_disabled_from_db` 恢复，cooldown 状态丢弃。
-- 一个 Key 限流不影响同渠道其他 Key；渠道下所有 Key 不可用 → 跳下一渠道。
+- 一个 Key 在某模型上限流不影响同渠道其他 Key，也不影响该 Key 服务其他模型；渠道下所有 Key 不可用 → 跳下一渠道。
 
 ### AllKeys 耗尽（503）
 

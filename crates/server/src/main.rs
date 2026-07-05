@@ -140,11 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Runs every 10s (was 30s) — `check_recoveries` is no longer called
     // per-request (see `select_keys` in executor.rs), so the background
-    // loop is now the only driver of cooldown recovery + small-model quota
-    // window rollover. A shorter interval reduces the lag on
-    // `consecutive_failures` resets (which only affect backoff window
-    // length, not availability — `is_available` checks `cooldown_until`
-    // inline and is independent of this loop).
+    // loop is now the only driver of per-(key, model) cooldown cleanup +
+    // small-model quota window rollover. A shorter interval reduces the
+    // lag on `consecutive_failures` resets (which only affect backoff
+    // window length, not availability — `is_available` checks
+    // per-model `cooldown_until` inline and is independent of this loop).
     let health_clone = state.health.clone();
     tokio::spawn(async move {
         loop {

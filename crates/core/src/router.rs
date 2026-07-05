@@ -11,10 +11,11 @@
 //!    contains `user_group` are kept.
 //! 2. **quota_filter**: drop the whole binding if `quota_filter(channel_id,
 //!    upstream_model_name)` returns false (small-model quota exhausted).
-//! 3. **is_key_available**: a key is dropped if `is_key_available(key.id)`
-//!    returns false (cooldown / disabled / quota-exhausted at the runtime
-//!    layer). If a binding's channel ends up with no surviving keys, the
-//!    binding is dropped and the next candidate is tried.
+//! 3. **is_key_available**: a key is dropped if
+//!    `is_key_available(key.id, upstream_model_name)` returns false
+//!    (per-(key, upstream_model) cooldown / key disabled / quota-exhausted
+//!    at the runtime layer). If a binding's channel ends up with no
+//!    surviving keys, the binding is dropped and the next candidate is tried.
 //!
 //! ## Strategy (binding-level)
 //! - **Priority**: bindings are sorted by `binding_priority` ascending; keys
@@ -54,10 +55,15 @@ impl Router {
     /// that the executor walks outer = binding, inner = key.
     ///
     /// See the module docs for the filtering order and the strategy branches.
+    ///
+    /// `is_key_available` takes `(key_id, upstream_model_name)` so that
+    /// per-(key, model) cooldown granularity can be enforced: a key cooling
+    /// down on one upstream model is still available for other models it
+    /// is bound to.
     pub fn route(
         channels: Vec<(ChannelConfig, Vec<KeyConfig>, String, i32, i32)>,
         user_group: &str,
-        is_key_available: impl Fn(i64) -> bool,
+        is_key_available: impl Fn(i64, &str) -> bool,
         strategy: RoutingStrategy,
         quota_filter: impl Fn(i64, &str) -> bool,
     ) -> Vec<Vec<RoutedKey>> {
@@ -80,10 +86,10 @@ impl Router {
             if !quota_filter(channel.id, &upstream_model_name) {
                 continue;
             }
-            // 3. expand + key availability filter
+            // 3. expand + key availability filter (per-(key, upstream_model))
             let mut bucket: Vec<RoutedKey> = Vec::new();
             for key in keys {
-                if !is_key_available(key.id) {
+                if !is_key_available(key.id, &upstream_model_name) {
                     continue;
                 }
                 bucket.push(RoutedKey {
@@ -210,7 +216,7 @@ mod tests {
         }
     }
 
-    fn all_available(_id: i64) -> bool {
+    fn all_available(_id: i64, _up: &str) -> bool {
         true
     }
 
@@ -290,7 +296,7 @@ mod tests {
         let k_down = key(11, 1, CostTier::Paid, 100, None);
         let input = vec![(ch, vec![k_ok.clone(), k_down], "u".into(), 100, 1)];
 
-        let out = Router::route(input, "default", |id| id == 10, RoutingStrategy::Priority, quota_ok);
+        let out = Router::route(input, "default", |id, _up| id == 10, RoutingStrategy::Priority, quota_ok);
         assert_eq!(out.len(), 1); // 1 binding
         assert_eq!(out[0].len(), 1); // 1 surviving key
         assert_eq!(out[0][0].key.id, 10);
@@ -437,11 +443,39 @@ mod tests {
         let out = Router::route(
             input,
             "default",
-            |id| id != 10,
+            |id, _up| id != 10,
             RoutingStrategy::Priority,
             quota_ok,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0][0].channel.id, 2);
+    }
+
+    #[test]
+    fn test_per_key_model_availability_isolation() {
+        // 核心场景：同一 key 10 绑定到两个不同的 upstream_model
+        // ("deepseek" 和 "gemini")。key 10 在 "deepseek" 上冷却，
+        // 但在 "gemini" 上仍然可用。Router 应该：
+        // - 丢弃 deepseek binding（key 10 对 deepseek 不可用）
+        // - 保留 gemini binding（key 10 对 gemini 可用）
+        let ch = channel(1, "default");
+        let k = key(10, 1, CostTier::Paid, 100, None);
+        let input = vec![
+            (ch.clone(), vec![k.clone()], "deepseek".into(), 50, 1),
+            (ch.clone(), vec![k.clone()], "gemini".into(), 100, 1),
+        ];
+
+        // key 10 只对 "deepseek" 不可用，对 "gemini" 可用
+        let out = Router::route(
+            input,
+            "default",
+            |id, up| !(id == 10 && up == "deepseek"),
+            RoutingStrategy::Priority,
+            quota_ok,
+        );
+        // deepseek binding 被丢弃，只剩 gemini binding
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0][0].upstream_model_name, "gemini");
+        assert_eq!(out[0][0].key.id, 10);
     }
 }

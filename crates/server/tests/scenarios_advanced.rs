@@ -284,7 +284,8 @@ async fn test_scenario_8_key_retry_on_429() {
         content
     );
 
-    // Assert — key1 is now in Cooldown state
+    // Assert — key1 is now in per-(key, upstream_model) cooldown for "gpt-4o".
+    // key1.status remains Active — cooldown is per-(key, model), not per-key.
     let key1_state = env
         .state
         .health
@@ -293,8 +294,16 @@ async fn test_scenario_8_key_retry_on_429() {
         .expect("key1 should have a health state after failure");
     assert_eq!(
         key1_state.status,
-        chennix_common::KeyStatus::Cooldown,
-        "key1 should be in Cooldown after 429"
+        chennix_common::KeyStatus::Active,
+        "key1 status should remain Active (cooldown is per-model)"
+    );
+    let key1_cooldown = key1_state
+        .cooldowns
+        .get("gpt-4o")
+        .expect("key1 should have a cooldown entry for gpt-4o after 429");
+    assert!(
+        key1_cooldown.cooldown_until.is_some(),
+        "key1 cooldown for gpt-4o should have a window"
     );
 
     // Assert — key2 should NOT be in any error state (it succeeded)
@@ -306,6 +315,10 @@ async fn test_scenario_8_key_retry_on_429() {
             s.status.is_available(),
             "key2 should still be available, got {:?}",
             s.status
+        );
+        assert!(
+            !s.cooldowns.contains_key("gpt-4o"),
+            "key2 should not have a cooldown for gpt-4o (it succeeded)"
         );
     }
 

@@ -3,6 +3,15 @@
 //! Maintains per-key transient state (cooldown window, failure count,
 //! quota usage this period) and persists critical state changes (disabled,
 //! recovered) to the DB so that they survive server restarts.
+//!
+//! ## Cooldown granularity
+//! Cooldown is tracked **per (key_id, upstream_model_name)**, not per key.
+//! This means a key that times out or gets rate-limited on one upstream
+//! model is still available for other upstream models it is bound to.
+//! For example, if a key fails on `deepseek-chat`, it is still tried for
+//! `gemini-2.0-flash` — only the `(key, "deepseek-chat")` pair enters the
+//! cooldown window. Key-level `status` (Active/Disabled) is reserved for
+//! permanent failures (401/403) that affect the whole key.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,13 +29,28 @@ use crate::cache::{ConfigCache, QuotaStatus, QuotaWindow};
 /// Shared DB connection type used for persistence.
 pub type SharedDb = Arc<Mutex<Connection>>;
 
+/// Per-(key, upstream_model) cooldown state. Tracked inside
+/// [`KeyRuntimeState::cooldowns`] keyed by `upstream_model_name`.
+#[derive(Debug, Clone, Default)]
+pub struct CooldownEntry {
+    pub cooldown_until: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+}
+
 /// Transient per-key state kept in memory.
+///
+/// `status` reflects only persistent key-level state (Active/Disabled).
+/// Transient cooldowns live in `cooldowns`, keyed by upstream model name,
+/// so a key cooling down on one model is still available for others.
 #[derive(Debug, Clone)]
 pub struct KeyRuntimeState {
     pub key_id: i64,
     pub status: KeyStatus,
-    pub cooldown_until: Option<DateTime<Utc>>,
-    pub consecutive_failures: u32,
+    /// Per-(key, upstream_model) cooldown state. Empty when the key has
+    /// no active cooldowns on any upstream model. Entries are cleared by
+    /// [`check_recoveries`](HealthManager::check_recoveries) once they
+    /// expire (memory hygiene + fresh backoff on next failure).
+    pub cooldowns: HashMap<String, CooldownEntry>,
     pub used_quota_this_period: u64,
 }
 
@@ -35,8 +59,7 @@ impl KeyRuntimeState {
         Self {
             key_id,
             status: KeyStatus::Active,
-            cooldown_until: None,
-            consecutive_failures: 0,
+            cooldowns: HashMap::new(),
             used_quota_this_period: 0,
         }
     }
@@ -140,69 +163,88 @@ impl HealthManager {
         tracing::info!("restored {} disabled keys from DB", map.values().filter(|s| s.status == KeyStatus::Disabled).count());
     }
 
-    /// True iff the key is `Active` and not currently in a cooldown window.
-    pub async fn is_available(&self, key_id: i64) -> bool {
+    /// True iff the key is available for the given upstream model:
+    /// key-level `status` is not Disabled/QuotaExhausted AND there is no
+    /// active per-(key, upstream_model) cooldown window.
+    pub async fn is_available(&self, key_id: i64, upstream_model: &str) -> bool {
         let map = self.states.read().await;
-        Self::check_available(&map, key_id)
+        Self::check_available(&map, key_id, upstream_model)
     }
 
     /// Non-async variant of `is_available` for use inside synchronous
-    /// contexts (e.g. the `Fn(i64) -> bool` predicate passed to
+    /// contexts (e.g. the `Fn(i64, &str) -> bool` predicate passed to
     /// `Router::route`). Uses `try_read`: if the lock is contended it
     /// returns `true` (optimistic) so the caller can fall through to the
     /// authoritative async check in the executor's per-key loop.
-    pub fn try_is_available(&self, key_id: i64) -> bool {
+    pub fn try_is_available(&self, key_id: i64, upstream_model: &str) -> bool {
         match self.states.try_read() {
-            Ok(map) => Self::check_available(&map, key_id),
+            Ok(map) => Self::check_available(&map, key_id, upstream_model),
             Err(_) => true, // optimistic — async path will re-check
         }
     }
 
     /// Shared implementation for both async + sync variants.
     ///
-    /// 可用性判断逻辑：
-    /// - `Active` → 可用（除非有未过期的 cooldown_until，防御性检查）
-    /// - `Cooldown` + `cooldown_until > now` → 不可用（冷却期内）
-    /// - `Cooldown` + `cooldown_until <= now` → **可用**（冷却到期，零延迟恢复）
-    /// - `Disabled` / `QuotaExhausted` → 不可用
+    /// 可用性判断逻辑（per-(key, upstream_model) 粒度）：
+    /// - key.status 为 `Disabled` / `QuotaExhausted` → 不可用（key 本身坏了）
+    /// - key.status 为 `Active` 或 `Cooldown`（legacy） → 检查 per-model cooldown
+    /// - `cooldowns[upstream_model].cooldown_until > now` → 不可用（该模型冷却中）
+    /// - 否则 → 可用
     ///
-    /// 关键：`Cooldown` 到期后不依赖 `check_recoveries` 改 status 才恢复——
-    /// `is_available` 内联检查 `cooldown_until`，确保冷却到期立即可用。
-    /// 后台 `check_recoveries` 只负责重置 `consecutive_failures`（退避窗口）
-    /// 和 persist status 到 DB，不在可用性关键路径上。
-    fn check_available(map: &HashMap<i64, KeyRuntimeState>, key_id: i64) -> bool {
+    /// 关键：cooldown 到期后 `is_available` 内联检查立即返回 true，
+    /// 不依赖 `check_recoveries` 改状态。后台 `check_recoveries` 只负责
+    /// 清理过期的 cooldown 条目（内存回收 + 重置退避计数器），不在
+    /// 可用性关键路径上。
+    fn check_available(
+        map: &HashMap<i64, KeyRuntimeState>,
+        key_id: i64,
+        upstream_model: &str,
+    ) -> bool {
         match map.get(&key_id) {
             None => true, // unseen keys are considered available
             Some(state) => {
-                // 先检查 cooldown_until（对所有状态通用，但主要针对 Cooldown）
-                if let Some(until) = state.cooldown_until {
-                    if until > Utc::now() {
-                        // 冷却未到期：无论 status 如何，都不可用
-                        return false;
-                    }
-                    // 冷却已到期：继续检查 status
+                // Key-level status check.
+                // `|| status == Cooldown` 保留是为了兼容 legacy DB 行
+                // （旧版本可能将 status 持久化为 Cooldown）；新代码运行时
+                // 永远不会设置 status=Cooldown，cooldown 完全由 `cooldowns`
+                // map 跟踪。
+                if !(state.status.is_available() || state.status == KeyStatus::Cooldown) {
+                    return false;
                 }
-                // 冷却已到期或无冷却：按 status 判断
-                // Cooldown 到期后视为可用（零延迟恢复，对齐 new-api 行为）
-                state.status.is_available() || state.status == KeyStatus::Cooldown
+                // Per-(key, upstream_model) cooldown check.
+                if let Some(entry) = state.cooldowns.get(upstream_model) {
+                    if let Some(until) = entry.cooldown_until {
+                        if until > Utc::now() {
+                            return false;
+                        }
+                    }
+                }
+                true
             }
         }
     }
 
-    /// Apply exponential backoff: the next cooldown lasts `2^n` seconds
-    /// (capped at 1800s = 30min), where `n` is the updated failure count.
+    /// Apply exponential backoff for the (key_id, upstream_model) pair:
+    /// the next cooldown lasts `2^n` seconds (capped at 1800s = 30min),
+    /// where `n` is the updated failure count for this specific pair.
     /// Each successive `mark_cooldown` call within the failure streak
     /// doubles the window.
     ///
-    /// Cooldown is transient — it is **not** persisted to the DB.
-    pub async fn mark_cooldown(&self, key_id: i64) {
+    /// **Does NOT change `key.status`** — the key remains Active for other
+    /// upstream models. Cooldown is transient and is **not** persisted to
+    /// the DB.
+    pub async fn mark_cooldown(&self, key_id: i64, upstream_model: &str) {
         let mut map = self.states.write().await;
         let state = map.entry(key_id).or_insert_with(|| KeyRuntimeState::new(key_id));
-        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        let n = state.consecutive_failures;
+        let entry = state
+            .cooldowns
+            .entry(upstream_model.to_string())
+            .or_default();
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        let n = entry.consecutive_failures;
         let secs = (1i64 << n.min(31)).min(MAX_COOLDOWN_SECS);
-        state.cooldown_until = Some(Utc::now() + Duration::seconds(secs));
-        state.status = KeyStatus::Cooldown;
+        entry.cooldown_until = Some(Utc::now() + Duration::seconds(secs));
+        // state.status 不变 — cooldown 是 per-(key, model)，不影响其他模型
     }
 
     /// Permanently disable a key in the runtime layer (e.g. on 401/403).
@@ -213,9 +255,9 @@ impl HealthManager {
             let mut map = self.states.write().await;
             let state = map.entry(key_id).or_insert_with(|| KeyRuntimeState::new(key_id));
             state.status = KeyStatus::Disabled;
-            state.cooldown_until = None;
-            // We keep consecutive_failures so a later restore_disabled+mark_cooldown
-            // chain still has history, though restore_disabled resets it.
+            state.cooldowns.clear();
+            // Clear per-model cooldowns: the key is Disabled, so no model
+            // is available anyway. Keeps the state tidy.
         }
         // Persist to DB (outside the in-memory lock to avoid holding it across I/O).
         self.persist_status(key_id, KeyStatus::Disabled).await;
@@ -231,35 +273,32 @@ impl HealthManager {
         state.used_quota_this_period = state.used_quota_this_period.saturating_add(tokens);
     }
 
-    /// Clear expired cooldowns, returning affected keys to `Active`.
-    /// Also persists recovered keys to the DB.
+    /// Clear expired per-(key, upstream_model) cooldown entries.
     ///
     /// Called only by the background loop in `main.rs` (every 10s) — NOT
     /// on the per-request path. `is_available` checks `cooldown_until`
-    /// inline so availability is unaffected; this loop only resets
-    /// `consecutive_failures` (backoff window) and rolls over small-model
-    /// quota windows.
+    /// inline so availability is unaffected by this loop's cadence; this
+    /// method only reclaims memory (drops expired entries) and resets
+    /// `consecutive_failures` so the next failure on a (key, model) pair
+    /// starts a fresh backoff window rather than continuing an old streak.
+    ///
+    /// Cooldown is transient — no DB writes happen here. Only `mark_disabled`
+    /// and `restore_disabled` persist key status.
     pub async fn check_recoveries(&self) {
         let now = Utc::now();
-        let mut recovered_ids: Vec<i64> = Vec::new();
         {
             let mut map = self.states.write().await;
             for state in map.values_mut() {
-                if state.status == KeyStatus::Cooldown {
-                    if let Some(until) = state.cooldown_until {
-                        if until <= now {
-                            state.status = KeyStatus::Active;
-                            state.cooldown_until = None;
-                            state.consecutive_failures = 0;
-                            recovered_ids.push(state.key_id);
-                        }
-                    }
-                }
+                // Retain only entries whose cooldown_until is still in the
+                // future. Entries with `cooldown_until = None` are stale
+                // (shouldn't normally happen) and are dropped.
+                state.cooldowns.retain(|_, entry| {
+                    entry
+                        .cooldown_until
+                        .map(|until| until > now)
+                        .unwrap_or(false)
+                });
             }
-        }
-        // Persist recovered keys to DB as active.
-        for id in recovered_ids {
-            self.persist_status(id, KeyStatus::Active).await;
         }
 
         // Small-model quota period resets (day/month windows roll over).
@@ -275,8 +314,7 @@ impl HealthManager {
             for id in &key_ids {
                 let state = map.entry(*id).or_insert_with(|| KeyRuntimeState::new(*id));
                 state.status = KeyStatus::Active;
-                state.cooldown_until = None;
-                state.consecutive_failures = 0;
+                state.cooldowns.clear();
             }
         }
         for id in key_ids {
@@ -292,8 +330,9 @@ impl HealthManager {
         let state = map.entry(key_id).or_insert_with(|| KeyRuntimeState::new(key_id));
         state.status = new_status;
         if new_status == KeyStatus::Active {
-            state.cooldown_until = None;
-            state.consecutive_failures = 0;
+            // Re-enabling a key → clear any stale per-model cooldowns so
+            // it gets a fresh start.
+            state.cooldowns.clear();
         }
     }
 
@@ -489,55 +528,89 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_mark_cooldown_sets_status_and_window() {
+    async fn test_mark_cooldown_sets_per_model_window() {
         let h = HealthManager::new();
-        assert!(h.is_available(1).await);
+        assert!(h.is_available(1, "model-a").await);
 
-        h.mark_cooldown(1).await;
+        h.mark_cooldown(1, "model-a").await;
         let s = h.get_state(1).await.unwrap();
-        assert_eq!(s.status, KeyStatus::Cooldown);
-        assert!(s.cooldown_until.is_some());
-        assert_eq!(s.consecutive_failures, 1);
-        assert!(!h.is_available(1).await);
+        // status 保持 Active — cooldown 只影响 (key, "model-a")，不影响 key 本身
+        assert_eq!(s.status, KeyStatus::Active);
+        let entry = s.cooldowns.get("model-a").expect("cooldown entry for model-a");
+        assert!(entry.cooldown_until.is_some());
+        assert_eq!(entry.consecutive_failures, 1);
+        // (key, "model-a") 不可用
+        assert!(!h.is_available(1, "model-a").await);
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_isolated_per_upstream_model() {
+        // 核心回归测试：同一 key 绑定到多个 upstream_model 时，
+        // 一个模型冷却不影响其他模型。这是方案 B 修复的关键场景：
+        //   key 1 绑定 "deepseek-chat" 和 "gemini-flash"
+        //   deepseek-chat 超时 → (key1, "deepseek-chat") 冷却
+        //   gemini-flash 仍然可用 → 不应被跳过
+        let h = HealthManager::new();
+
+        // 初始：两个模型都可用
+        assert!(h.is_available(1, "deepseek-chat").await);
+        assert!(h.is_available(1, "gemini-flash").await);
+
+        // deepseek-chat 失败 → 只冷却 (key1, "deepseek-chat")
+        h.mark_cooldown(1, "deepseek-chat").await;
+
+        // deepseek-chat 不可用，但 gemini-flash 仍然可用
+        assert!(!h.is_available(1, "deepseek-chat").await, "deepseek-chat should be in cooldown");
+        assert!(h.is_available(1, "gemini-flash").await, "gemini-flash must remain available");
+
+        // key.status 仍是 Active（没被 cooldown 影响）
+        let s = h.get_state(1).await.unwrap();
+        assert_eq!(s.status, KeyStatus::Active);
+        // 只有 deepseek-chat 在 cooldowns map 中
+        assert_eq!(s.cooldowns.len(), 1);
+        assert!(s.cooldowns.contains_key("deepseek-chat"));
+        assert!(!s.cooldowns.contains_key("gemini-flash"));
     }
 
     #[tokio::test]
     async fn test_cooldown_expired_zero_latency_recovery() {
-        // 关键回归测试：Cooldown 到期后 is_available 必须立即返回 true，
-        // 不依赖 check_recoveries 改 status。这是 2.5 修复的基础——
-        // 移除每请求 check_recoveries 后，可用性零延迟恢复。
+        // 关键回归测试：cooldown 到期后 is_available 必须立即返回 true，
+        // 不依赖 check_recoveries。后台 check_recoveries 只负责清理
+        // 过期条目（内存回收），不在可用性关键路径上。
         let h = HealthManager::new();
 
-        // 设置 Cooldown + 过期的 cooldown_until（模拟冷却到期但
+        // 设置一个已过期的 per-model cooldown（模拟冷却到期但
         // check_recoveries 还没跑的场景）
         {
             let mut map = h.states.write().await;
             let state = map.entry(1).or_insert_with(|| KeyRuntimeState::new(1));
-            state.status = KeyStatus::Cooldown;
-            state.cooldown_until = Some(Utc::now() - Duration::seconds(1)); // 1秒前到期
-            state.consecutive_failures = 3;
+            state.cooldowns.insert(
+                "model-a".to_string(),
+                CooldownEntry {
+                    cooldown_until: Some(Utc::now() - Duration::seconds(1)), // 1秒前到期
+                    consecutive_failures: 3,
+                },
+            );
         }
 
-        // 冷却到期 → 立即可用（即使 status 仍是 Cooldown）
-        assert!(h.is_available(1).await, "expired cooldown should be available");
+        // 冷却到期 → 立即可用
+        assert!(h.is_available(1, "model-a").await, "expired cooldown should be available");
+        assert!(h.try_is_available(1, "model-a"), "expired cooldown should be available (sync)");
 
-        // 同步路径也要验证（Router::route 用 try_is_available）
-        assert!(h.try_is_available(1), "expired cooldown should be available (sync)");
-
-        // status 仍是 Cooldown（check_recoveries 才会改成 Active）
+        // 条目仍在 map 中（check_recoveries 才会清理），但不影响可用性
         let s = h.get_state(1).await.unwrap();
-        assert_eq!(s.status, KeyStatus::Cooldown, "status not yet reset by check_recoveries");
+        assert!(s.cooldowns.contains_key("model-a"), "entry not yet cleaned by check_recoveries");
     }
 
     #[tokio::test]
     async fn test_cooldown_not_yet_expired_unavailable() {
-        // 对比测试：Cooldown 未到期 → 不可用
+        // 对比测试：cooldown 未到期 → 不可用
         let h = HealthManager::new();
-        h.mark_cooldown(1).await; // 默认 cooldown 至少 2 秒
+        h.mark_cooldown(1, "model-a").await; // 默认 cooldown 至少 2 秒
 
         // 冷却未到期 → 不可用
-        assert!(!h.is_available(1).await, "active cooldown should be unavailable");
-        assert!(!h.try_is_available(1), "active cooldown should be unavailable (sync)");
+        assert!(!h.is_available(1, "model-a").await, "active cooldown should be unavailable");
+        assert!(!h.try_is_available(1, "model-a"), "active cooldown should be unavailable (sync)");
     }
 
     #[tokio::test]
@@ -546,10 +619,11 @@ mod tests {
         // Track the cooldown window after each failure.
         let mut windows: Vec<i64> = Vec::new();
         for _ in 0..12 {
-            h.mark_cooldown(1).await;
+            h.mark_cooldown(1, "model-a").await;
             let s = h.get_state(1).await.unwrap();
+            let entry = s.cooldowns.get("model-a").expect("entry exists");
             let now = Utc::now();
-            let secs = s
+            let secs = entry
                 .cooldown_until
                 .map(|t| (t - now).num_seconds().max(0))
                 .unwrap_or(0);
@@ -586,26 +660,43 @@ mod tests {
                 1,
                 KeyRuntimeState {
                     key_id: 1,
-                    status: KeyStatus::Cooldown,
-                    cooldown_until: Some(Utc::now() - Duration::seconds(60)),
-                    consecutive_failures: 3,
+                    status: KeyStatus::Active,
+                    cooldowns: {
+                        let mut m = HashMap::new();
+                        m.insert(
+                            "model-a".to_string(),
+                            CooldownEntry {
+                                cooldown_until: Some(Utc::now() - Duration::seconds(60)),
+                                consecutive_failures: 3,
+                            },
+                        );
+                        m
+                    },
                     used_quota_this_period: 0,
                 },
             );
         }
-        // 过期 cooldown 在 check_recoveries 之前就已可用（零延迟恢复，
-        // 见 test_cooldown_expired_zero_latency_recovery）。这里不再断言
-        // "check_recoveries 之前不可用"——那是旧行为。
-        assert!(h.is_available(1).await);
+        // 过期 cooldown 在 check_recoveries 之前就已可用（零延迟恢复）。
+        assert!(h.is_available(1, "model-a").await);
 
-        // check_recoveries 的职责：重置 status 为 Active + 清 cooldown_until
-        // + 清 consecutive_failures + persist 到 DB。
+        // check_recoveries 的职责：清理过期的 cooldown 条目（内存回收 +
+        // 重置 consecutive_failures，使下次失败重新开始退避）。
         h.check_recoveries().await;
         let s = h.get_state(1).await.unwrap();
-        assert_eq!(s.status, KeyStatus::Active);
-        assert!(s.cooldown_until.is_none());
-        assert_eq!(s.consecutive_failures, 0);
-        assert!(h.is_available(1).await);
+        assert!(s.cooldowns.is_empty(), "expired entry should be cleaned up");
+        assert!(h.is_available(1, "model-a").await);
+    }
+
+    #[tokio::test]
+    async fn test_check_recoveries_keeps_active_cooldowns() {
+        // 对比测试：未过期的 cooldown 不应被 check_recoveries 清理
+        let h = HealthManager::new();
+        h.mark_cooldown(1, "model-a").await; // 至少 2 秒未到期
+
+        h.check_recoveries().await;
+        let s = h.get_state(1).await.unwrap();
+        assert!(s.cooldowns.contains_key("model-a"), "active cooldown should not be cleared");
+        assert!(!h.is_available(1, "model-a").await);
     }
 
     #[tokio::test]
@@ -613,20 +704,21 @@ mod tests {
         let h = HealthManager::new();
 
         // unseen key → available
-        assert!(h.is_available(999).await);
+        assert!(h.is_available(999, "any-model").await);
 
-        // disabled key → unavailable
+        // disabled key → unavailable (for any model)
         h.mark_disabled(2).await;
-        assert!(!h.is_available(2).await);
+        assert!(!h.is_available(2, "model-a").await);
+        assert!(!h.is_available(2, "model-b").await);
         let s = h.get_state(2).await.unwrap();
         assert_eq!(s.status, KeyStatus::Disabled);
 
         // restore_disabled brings it back
         h.restore_disabled(vec![2]).await;
-        assert!(h.is_available(2).await);
+        assert!(h.is_available(2, "model-a").await);
         let s = h.get_state(2).await.unwrap();
         assert_eq!(s.status, KeyStatus::Active);
-        assert_eq!(s.consecutive_failures, 0);
+        assert!(s.cooldowns.is_empty());
     }
 
     #[tokio::test]
@@ -652,11 +744,11 @@ mod tests {
     async fn test_sync_key_from_db() {
         let h = HealthManager::new();
         h.mark_disabled(5).await;
-        assert!(!h.is_available(5).await);
+        assert!(!h.is_available(5, "model-a").await);
 
         // Simulate admin re-enabling the key via DB → memory sync.
         h.sync_key_from_db(5, KeyStatus::Active).await;
-        assert!(h.is_available(5).await);
+        assert!(h.is_available(5, "model-a").await);
     }
 
     #[tokio::test]
@@ -732,13 +824,13 @@ mod tests {
         let h = HealthManager::with_db(db.clone());
 
         // Before loading, key 1 should be "available" (unseen).
-        assert!(h.is_available(1).await);
+        assert!(h.is_available(1, "any-model").await);
 
         // Load disabled keys from DB.
         h.load_disabled_from_db().await;
 
         // Now key 1 should be unavailable.
-        assert!(!h.is_available(1).await);
+        assert!(!h.is_available(1, "any-model").await);
         let s = h.get_state(1).await.unwrap();
         assert_eq!(s.status, KeyStatus::Disabled);
     }
