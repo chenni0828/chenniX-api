@@ -2,7 +2,7 @@ import { Fragment, useEffect, useState, useCallback } from "react"
 import {
   Plus, RefreshCw, Pencil, Trash2, Key, ArrowLeft, Loader2, Server,
   HelpCircle, ChevronDown, ChevronRight, Zap, Copy, Check,
-  Gauge, RotateCcw, Search, GripVertical,
+  Gauge, RotateCcw, Search, GripVertical, X,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -69,6 +69,19 @@ function statusToValue(status: string): string {
 function maskKey(_key: string): string {
   if (_key.length <= 12) return _key
   return _key.slice(0, 8) + "..." + _key.slice(-4)
+}
+
+// Split a draft string into completed tokens + remaining draft.
+// Supports English comma ",", Chinese comma "，" and newline as separators.
+function splitDraft(value: string): { completed: string[]; draft: string } {
+  if (!/[,，\n]/.test(value)) {
+    return { completed: [], draft: value }
+  }
+  const normalized = value.split("，").join(",").split("\n").join(",")
+  const parts = normalized.split(",")
+  const draft = parts.length > 0 ? parts[parts.length - 1] : ""
+  const completed = parts.slice(0, -1).map((p: string) => p.trim()).filter(Boolean)
+  return { completed, draft }
 }
 
 // ===== Types =====
@@ -165,6 +178,18 @@ export default function Channels() {
   const [discoveredList, setDiscoveredList] = useState<string[]>([])
   const [discoveredSelected, setDiscoveredSelected] = useState<Set<string>>(new Set())
   const [addingDiscovered, setAddingDiscovered] = useState(false)
+  const [discoveredSearch, setDiscoveredSearch] = useState("")
+
+  // Manual add-models dialog state
+  const [manualDialogOpen, setManualDialogOpen] = useState(false)
+  const [manualChannel, setManualChannel] = useState<ChannelConfig | null>(null)
+  const [manualModels, setManualModels] = useState<string[]>([])
+  const [manualInput, setManualInput] = useState("")
+  const [addingManual, setAddingManual] = useState(false)
+
+  const filteredDiscovered = discoveredList.filter(name =>
+    name.toLowerCase().includes(discoveredSearch.toLowerCase())
+  )
 
   const fetchChannels = useCallback(async () => {
     setLoading(true)
@@ -220,7 +245,10 @@ export default function Channels() {
       const result = await channelApi.discoverModelsByChannel(ch.id)
       const all = result.models
       if (all.length === 0) {
-        toast({ title: "上游未返回任何模型" })
+        const hasModels = Object.values(smallModelsMap).some(sm => sm.channel_id === ch.id)
+        toast({
+          title: hasModels ? "上游未返回任何模型" : "上游未返回任何模型，可点击「手动添加」录入",
+        })
         return
       }
       // Split into already-in-pool vs new. The pool is keyed by `${channel_id}|${raw_model_name}`.
@@ -233,10 +261,11 @@ export default function Channels() {
       setDiscoverChannel(ch)
       setDiscoveredList(all)
       setDiscoveredSelected(new Set(newModels))
+      setDiscoveredSearch("")
       setDiscoverDialogOpen(true)
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || "获取模型失败"
-      toast({ title: `${ch.name} 获取失败`, description: msg, variant: "destructive" })
+      toast({ title: `${ch.name} 获取失败`, description: `${msg}，可点击「手动添加」手动录入`, variant: "destructive" })
     } finally {
       setDiscoveringChannels(prev => {
         const next = new Set(prev)
@@ -258,6 +287,7 @@ export default function Channels() {
       setDiscoverDialogOpen(false)
       setDiscoveredList([])
       setDiscoveredSelected(new Set())
+      setDiscoveredSearch("")
       setDiscoverChannel(null)
       await fetchSmallModels()
     } catch (err: unknown) {
@@ -265,6 +295,76 @@ export default function Channels() {
       toast({ title: msg, variant: "destructive" })
     } finally {
       setAddingDiscovered(false)
+    }
+  }
+
+  const openManualAdd = (ch: ChannelConfig) => {
+    setManualChannel(ch)
+    setManualModels([])
+    setManualInput("")
+    setManualDialogOpen(true)
+  }
+
+  const commitManualInput = (raw: string) => {
+    const { completed, draft } = splitDraft(raw)
+    if (completed.length === 0) return
+    setManualModels(prev => {
+      const next = [...prev]
+      const seen = new Set(next)
+      for (const m of completed) {
+        if (!seen.has(m)) {
+          next.push(m)
+          seen.add(m)
+        }
+      }
+      return next
+    })
+    setManualInput(draft)
+  }
+
+  const handleManualKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      e.preventDefault()
+      const trimmed = manualInput.trim()
+      if (trimmed) {
+        commitManualInput(manualInput)
+      }
+      return
+    }
+    if (e.key === "Backspace" && manualInput === "" && manualModels.length > 0) {
+      e.preventDefault()
+      setManualModels(prev => prev.slice(0, -1))
+    }
+  }
+
+  const handleConfirmAddManual = async () => {
+    if (!manualChannel) return
+    // Commit any leftover draft before submitting.
+    const trimmed = manualInput.trim()
+    const finalList = (() => {
+      if (!trimmed) return manualModels
+      const seen = new Set(manualModels)
+      const next = [...manualModels]
+      if (!seen.has(trimmed)) {
+        next.push(trimmed)
+      }
+      return next
+    })()
+    if (finalList.length === 0) return
+    setAddingManual(true)
+    try {
+      const result = await channelApi.addDiscoveredModels(manualChannel.id, finalList)
+      toast({ title: `已加入 ${result.added} 个模型` })
+      setManualDialogOpen(false)
+      setManualChannel(null)
+      setManualModels([])
+      setManualInput("")
+      await fetchSmallModels()
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || "加入失败"
+      toast({ title: msg, variant: "destructive" })
+    } finally {
+      setAddingManual(false)
     }
   }
 
@@ -919,17 +1019,27 @@ export default function Channels() {
                             <div className="space-y-3">
                               <div className="flex items-center justify-between">
                                 <p className="text-sm font-medium">已发现模型</p>
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => handleDiscoverModels(ch)}
-                                  disabled={isDiscovering}
-                                >
-                                  {isDiscovering
-                                    ? <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                                    : <Search className="mr-1 h-3 w-3" />}
-                                  获取模型
-                                </Button>
+                                <div className="flex items-center gap-2">
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => openManualAdd(ch)}
+                                  >
+                                    <Plus className="mr-1 h-3 w-3" />
+                                    手动添加
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => handleDiscoverModels(ch)}
+                                    disabled={isDiscovering}
+                                  >
+                                    {isDiscovering
+                                      ? <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                      : <Search className="mr-1 h-3 w-3" />}
+                                    获取模型
+                                  </Button>
+                                </div>
                               </div>
                               {smallModelsLoading ? (
                                 <div className="flex items-center gap-2 py-2">
@@ -937,7 +1047,7 @@ export default function Channels() {
                                   <span className="text-sm text-muted-foreground">加载模型列表...</span>
                                 </div>
                               ) : channelSmallModels.length === 0 ? (
-                                <p className="text-sm text-muted-foreground">暂无模型，点击「获取模型」从上游拉取</p>
+                                <p className="text-sm text-muted-foreground">暂无模型，点击「获取模型」从上游拉取，或点击「手动添加」录入</p>
                               ) : (
                                 <div className="flex flex-col gap-1.5">
                                   {channelSmallModels.map((sm) => {
@@ -1442,6 +1552,7 @@ export default function Channels() {
           if (!open) {
             setDiscoveredList([])
             setDiscoveredSelected(new Set())
+            setDiscoveredSearch("")
             setDiscoverChannel(null)
           }
         }}
@@ -1451,6 +1562,7 @@ export default function Channels() {
             <DialogTitle>选择要加入的模型 — {discoverChannel?.name}</DialogTitle>
             <DialogDescription>
               共 {discoveredList.length} 个，{discoveredSelected.size} 个新增待加入
+              {discoveredSearch && `（筛选出 ${filteredDiscovered.length} 个）`}
             </DialogDescription>
           </DialogHeader>
           <div className="flex items-center justify-between">
@@ -1461,57 +1573,90 @@ export default function Channels() {
               className="h-7 px-2 text-xs"
               onClick={() => {
                 if (!discoverChannel) return
-                const newModels = discoveredList.filter(
+                const filteredNewModels = filteredDiscovered.filter(
                   name => !(`${discoverChannel.id}|${name}` in smallModelsMap),
                 )
-                const allSelected = newModels.every(n => discoveredSelected.has(n))
-                setDiscoveredSelected(allSelected ? new Set() : new Set(newModels))
+                const allSelected = filteredNewModels.every(n => discoveredSelected.has(n))
+                setDiscoveredSelected(prev => {
+                  const next = new Set(prev)
+                  if (allSelected) {
+                    filteredNewModels.forEach(n => next.delete(n))
+                  } else {
+                    filteredNewModels.forEach(n => next.add(n))
+                  }
+                  return next
+                })
               }}
             >
               {(() => {
                 if (!discoverChannel) return "全选"
-                const newModels = discoveredList.filter(
+                const filteredNewModels = filteredDiscovered.filter(
                   name => !(`${discoverChannel.id}|${name}` in smallModelsMap),
                 )
-                return newModels.length > 0 && newModels.every(n => discoveredSelected.has(n))
+                return filteredNewModels.length > 0 && filteredNewModels.every(n => discoveredSelected.has(n))
                   ? "取消全选"
                   : "全选新增"
               })()}
             </Button>
           </div>
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="pl-8 pr-8"
+              placeholder="搜索模型名称..."
+              value={discoveredSearch}
+              onChange={e => setDiscoveredSearch(e.target.value)}
+            />
+            {discoveredSearch && (
+              <button
+                type="button"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                onClick={() => setDiscoveredSearch("")}
+                aria-label="清除搜索"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            )}
+          </div>
           <div className="max-h-[60vh] overflow-y-auto space-y-1 rounded-md border p-1">
-            {discoveredList.map((name) => {
-              const exists = discoverChannel
-                ? (`${discoverChannel.id}|${name}` in smallModelsMap)
-                : false
-              const checked = discoveredSelected.has(name)
-              return (
-                <label
-                  key={name}
-                  className={`flex items-center gap-2.5 rounded px-2 py-1.5 text-sm transition-colors ${
-                    exists ? "opacity-50" : "hover:bg-muted/60 cursor-pointer"
-                  }`}
-                >
-                  <Checkbox
-                    checked={exists ? true : checked}
-                    disabled={exists}
-                    onClick={() => {
-                      if (exists) return
-                      setDiscoveredSelected(prev => {
-                        const next = new Set(prev)
-                        if (checked) next.delete(name)
-                        else next.add(name)
-                        return next
-                      })
-                    }}
-                  />
-                  <span className="font-mono text-xs">{name}</span>
-                  {exists && (
-                    <Badge variant="secondary" className="ml-auto text-[10px]">已添加</Badge>
-                  )}
-                </label>
-              )
-            })}
+            {filteredDiscovered.length === 0 ? (
+              <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
+                没有匹配的模型
+              </div>
+            ) : (
+              filteredDiscovered.map((name) => {
+                const exists = discoverChannel
+                  ? (`${discoverChannel.id}|${name}` in smallModelsMap)
+                  : false
+                const checked = discoveredSelected.has(name)
+                return (
+                  <label
+                    key={name}
+                    className={`flex items-center gap-2.5 rounded px-2 py-1.5 text-sm transition-colors ${
+                      exists ? "opacity-50" : "hover:bg-muted/60 cursor-pointer"
+                    }`}
+                  >
+                    <Checkbox
+                      checked={exists ? true : checked}
+                      disabled={exists}
+                      onClick={() => {
+                        if (exists) return
+                        setDiscoveredSelected(prev => {
+                          const next = new Set(prev)
+                          if (checked) next.delete(name)
+                          else next.add(name)
+                          return next
+                        })
+                      }}
+                    />
+                    <span className="font-mono text-xs">{name}</span>
+                    {exists && (
+                      <Badge variant="secondary" className="ml-auto text-[10px]">已添加</Badge>
+                    )}
+                  </label>
+                )
+              })
+            )}
           </div>
           <DialogFooter>
             <Button
@@ -1527,6 +1672,83 @@ export default function Channels() {
             >
               {addingDiscovered && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {addingDiscovered ? "加入中..." : `加入所选 (${discoveredSelected.size})`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Manual Add Models Dialog */}
+      <Dialog
+        open={manualDialogOpen}
+        onOpenChange={(open) => {
+          setManualDialogOpen(open)
+          if (!open) {
+            setManualChannel(null)
+            setManualModels([])
+            setManualInput("")
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>手动添加模型 — {manualChannel?.name}</DialogTitle>
+            <DialogDescription>
+              输入模型名称，回车或逗号添加，支持批量
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-1.5 rounded-md border min-h-[2.5rem] p-2">
+              {manualModels.map((name, idx) => (
+                <Badge
+                  key={`${name}-${idx}`}
+                  variant="secondary"
+                  className="gap-1 pr-1 font-mono text-xs"
+                >
+                  {name}
+                  <button
+                    type="button"
+                    className="ml-0.5 rounded-full hover:bg-muted-foreground/20 p-0.5"
+                    onClick={() => setManualModels(prev => prev.filter((_, i) => i !== idx))}
+                    aria-label={`移除 ${name}`}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </Badge>
+              ))}
+              <input
+                className="flex-1 min-w-[8rem] bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                placeholder={manualModels.length === 0 ? "如：gpt-4o, claude-3-5-sonnet" : "继续输入..."}
+                value={manualInput}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (/[,，\n]/.test(v)) {
+                    commitManualInput(v)
+                  } else {
+                    setManualInput(v)
+                  }
+                }}
+                onKeyDown={handleManualKeyDown}
+                disabled={addingManual}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              回车或逗号（,）添加；输入框为空时 Backspace 删除最后一个；已在小模型池中的会被跳过
+            </p>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setManualDialogOpen(false)}
+              disabled={addingManual}
+            >
+              取消
+            </Button>
+            <Button
+              onClick={handleConfirmAddManual}
+              disabled={addingManual || (manualModels.length === 0 && manualInput.trim() === "")}
+            >
+              {addingManual && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {addingManual ? "加入中..." : `添加 (${manualModels.length + (manualInput.trim() ? 1 : 0)})`}
             </Button>
           </DialogFooter>
         </DialogContent>
