@@ -64,9 +64,10 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # 标签策略：latest（默认分支）+ commit hash（便于回滚）+ 语义化版本（tag 时）
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short # 每次构建带 commit hash 标签，便于回滚
+            type=sha,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
