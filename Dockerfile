@@ -41,7 +41,8 @@ COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/
 
 # 将前端构建产物复制到 rust-embed 读取的目录
-COPY --from=web-builder /app/web/../static ./crates/server/static
+# web-builder 的 WORKDIR 是 /app/web，vite 输出到 ../static → /app/static/
+COPY --from=web-builder /app/static ./crates/server/static
 
 # 诊断：确认前端产物存在（rust-embed 编译期需要 static/ 目录）
 RUN ls -la crates/server/static/ | head -20
