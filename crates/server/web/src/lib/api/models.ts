@@ -56,6 +56,18 @@ export interface ModelInfo {
   bindings: ModelBindingInfo[]
 }
 
+/**
+ * `POST /models` 返回的完整 model 对象。
+ *
+ * 注意：与后端 `ModelDetail` 对齐，**不含 `bindings` 字段**。
+ * 如需 bindings，请调用 `modelApi.list()` 或 `modelApi.get(id)`。
+ */
+export interface ModelDetail {
+  id: number
+  canonical_name: string
+  routing_strategy: RoutingStrategy
+}
+
 export interface TestModelResult {
   success: boolean
   latency_ms: number
@@ -72,10 +84,11 @@ export interface UpdateModelData {
 
 export const modelApi = {
   list: () => api.get<ModelInfo[]>('/models').then(r => r.data),
-  create: (data: CreateModelData) => api.post<number>('/models', data).then(r => r.data),
-  /** 仅创建 models 行；返回新建的完整模型对象 */
+  /** 创建 model，返回完整对象（含 id）；类型与后端 `ModelDetail` 对齐 */
+  create: (data: CreateModelData) => api.post<ModelDetail>('/models', data).then(r => r.data),
+  /** 同 `create`，便捷封装；返回 `ModelDetail`（不含 bindings） */
   createModel: (name: string) =>
-    api.post<ModelInfo>('/models', { canonical_name: name }).then(r => r.data),
+    api.post<ModelDetail>('/models', { canonical_name: name }).then(r => r.data),
   update: (id: number, data: UpdateModelData) => api.put(`/models/${id}`, data).then(r => r.data),
   delete: (id: number) => api.delete(`/models/${id}`).then(r => r.data),
   /** 切换大模型的路由策略（priority / load_balance） */

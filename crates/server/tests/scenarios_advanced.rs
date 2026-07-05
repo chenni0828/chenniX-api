@@ -309,12 +309,25 @@ async fn test_scenario_8_key_retry_on_429() {
         );
     }
 
-    // Assert — usage log should record the successful key (key2)
+    // Assert — usage logs:
+    //   1 failed  row for key1 (429 → track_failure)
+    //   1 success row for key2 (200 → track_success)
     let conn = env.db().await;
-    assert_eq!(common::count_usage_logs(&conn), 1);
-    let (_, _, key_id, _) = common::get_first_usage_log(&conn);
     assert_eq!(
-        key_id, common::KEY2_ID,
-        "usage log should record key2 as the successful key"
+        common::count_usage_logs(&conn),
+        2,
+        "retry scenario should produce 2 usage logs (1 failed + 1 success)"
+    );
+    let (_, _, failed_key_id, _) = common::get_usage_log_by_status(&conn, "failed")
+        .expect("should have a failed usage log for key1");
+    assert_eq!(
+        failed_key_id, common::KEY1_ID,
+        "failed usage log should record key1"
+    );
+    let (_, _, success_key_id, _) = common::get_usage_log_by_status(&conn, "success")
+        .expect("should have a success usage log for key2");
+    assert_eq!(
+        success_key_id, common::KEY2_ID,
+        "success usage log should record key2"
     );
 }

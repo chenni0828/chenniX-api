@@ -1,6 +1,8 @@
 use chennix_common::{CostTier, KeyConfig, KeyStatus, ProxyError, ProxyResult};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::now_iso8601;
+
 pub struct KeyRepo<'a> {
     conn: &'a Connection,
 }
@@ -21,12 +23,14 @@ impl<'a> KeyRepo<'a> {
         free_quota: Option<u64>,
         quota_reset_period: Option<&str>,
     ) -> ProxyResult<i64> {
+        let now = now_iso8601();
         self.conn
             .execute(
                 "INSERT INTO channel_keys
                  (channel_id, api_key, label, cost_tier, key_priority,
-                  price_per_1k_tokens, free_quota, quota_reset_period)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  price_per_1k_tokens, free_quota, quota_reset_period,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                 params![
                     channel_id,
                     api_key,
@@ -39,6 +43,7 @@ impl<'a> KeyRepo<'a> {
                     price_per_1k_tokens,
                     free_quota.map(|q| q as i64),
                     quota_reset_period,
+                    now,
                 ],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -89,8 +94,8 @@ impl<'a> KeyRepo<'a> {
         };
         self.conn
             .execute(
-                "UPDATE channel_keys SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![status_str, id],
+                "UPDATE channel_keys SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status_str, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -101,6 +106,36 @@ impl<'a> KeyRepo<'a> {
             .execute("DELETE FROM channel_keys WHERE id = ?1", params![id])
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// 统计指定渠道下与 `api_key` 重复的 key 数量（可排除某个 key_id，
+    /// 用于编辑场景排除自身）。同一渠道内不允许重复添加相同 api_key。
+    pub fn count_duplicate_api_key_in_channel(
+        &self,
+        channel_id: i64,
+        api_key: &str,
+        exclude_key_id: Option<i64>,
+    ) -> ProxyResult<i64> {
+        let count: i64 = if let Some(exclude_id) = exclude_key_id {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM channel_keys
+                     WHERE channel_id = ?1 AND api_key = ?2 AND id <> ?3",
+                    params![channel_id, api_key, exclude_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| ProxyError::Storage(e.to_string()))?
+        } else {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM channel_keys
+                     WHERE channel_id = ?1 AND api_key = ?2",
+                    params![channel_id, api_key],
+                    |row| row.get(0),
+                )
+                .map_err(|e| ProxyError::Storage(e.to_string()))?
+        };
+        Ok(count)
     }
 
     /// Return the IDs of all keys whose status is `'disabled'`.
@@ -124,8 +159,9 @@ impl<'a> KeyRepo<'a> {
     pub fn add_key_usage(&self, id: i64, tokens: u64) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE channel_keys SET used_quota = used_quota + ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![tokens as i64, id],
+                "UPDATE channel_keys SET used_quota = used_quota + ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![tokens as i64, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -157,8 +193,9 @@ impl<'a> KeyRepo<'a> {
     pub fn reset_key_quota(&self, key_id: i64, channel_id: i64) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE channel_keys SET used_quota = 0, updated_at = datetime('now') WHERE id = ?1 AND channel_id = ?2",
-                params![key_id, channel_id],
+                "UPDATE channel_keys SET used_quota = 0, updated_at = ?1
+                 WHERE id = ?2 AND channel_id = ?3",
+                params![now_iso8601(), key_id, channel_id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -189,13 +226,15 @@ impl<'a> KeyRepo<'a> {
         } else {
             None
         };
+        let now = now_iso8601();
         self.conn
             .execute(
                 "INSERT INTO channel_keys
                  (channel_id, api_key, label, cost_tier, key_priority,
-                  price_per_1k_tokens, free_quota, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active')",
-                params![channel_id, api_key, label, cost_tier, priority, price, free_quota],
+                  price_per_1k_tokens, free_quota, status,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?8)",
+                params![channel_id, api_key, label, cost_tier, priority, price, free_quota, now],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(self.conn.last_insert_rowid())
@@ -235,12 +274,112 @@ impl<'a> KeyRepo<'a> {
                 "UPDATE channel_keys
                  SET api_key = ?1, cost_tier = ?2, key_priority = ?3,
                      price_per_1k_tokens = ?4, free_quota = ?5, status = ?6,
-                     updated_at = datetime('now')
-                 WHERE id = ?7",
-                params![api_key, cost_tier, priority, price, free_quota, status_str, id],
+                     updated_at = ?7
+                 WHERE id = ?8",
+                params![api_key, cost_tier, priority, price, free_quota, status_str, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// 重新排序某渠道下 key 的 priority。
+    /// `ordered_key_ids` 是 key ID 列表，按调用优先级从高到低排列
+    /// （索引 0 = 最高优先级）。priority 按位置赋值为 `(i+1)*10`。
+    ///
+    /// 校验：
+    /// 1. 数量必须与该渠道现有 key 数量一致
+    /// 2. 所有 key ID 必须属于该 channel_id
+    /// 3. 所有 key ID 必须唯一（无重复）
+    pub fn reorder_keys(
+        &self,
+        channel_id: i64,
+        ordered_key_ids: &[i64],
+    ) -> ProxyResult<()> {
+        // 1. 查询该渠道现有 key IDs
+        let existing: Vec<i64> = {
+            let mut stmt = self.conn
+                .prepare("SELECT id FROM channel_keys WHERE channel_id = ?1")
+                .map_err(|e| ProxyError::Storage(e.to_string()))?;
+            let rows = stmt.query_map(params![channel_id], |r| r.get::<_, i64>(0))
+                .map_err(|e| ProxyError::Storage(e.to_string()))?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(|e| ProxyError::Storage(e.to_string()))?);
+            }
+            v
+        };
+        // 2. 校验数量
+        if ordered_key_ids.len() != existing.len() {
+            return Err(ProxyError::Storage(format!(
+                "reorder_keys: count mismatch (got {}, expected {})",
+                ordered_key_ids.len(),
+                existing.len()
+            )));
+        }
+        // 3. 校验唯一性
+        let mut seen = std::collections::HashSet::new();
+        for &id in ordered_key_ids {
+            if !seen.insert(id) {
+                return Err(ProxyError::Storage(format!(
+                    "reorder_keys: duplicate key id {}",
+                    id
+                )));
+            }
+        }
+        // 4. 校验归属
+        for &id in ordered_key_ids {
+            if !existing.contains(&id) {
+                return Err(ProxyError::Storage(format!(
+                    "reorder_keys: key id {} does not belong to channel {}",
+                    id, channel_id
+                )));
+            }
+        }
+        // 5. 事务内更新 priority
+        let tx = self.conn
+            .unchecked_transaction()
+            .map_err(|e| ProxyError::Storage(e.to_string()))?;
+        for (i, &key_id) in ordered_key_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE channel_keys SET key_priority = ?1, updated_at = ?2 WHERE id = ?3",
+                params![(i as i32 + 1) * 10, now_iso8601(), key_id],
+            )
+            .map_err(|e| ProxyError::Storage(e.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|e| ProxyError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 创建 key，priority 自动追加到末尾（max + 10）。
+    /// 用于前端移除 priority 输入后的创建场景。
+    pub fn create_key_auto_priority(
+        &self,
+        channel_id: i64,
+        api_key: &str,
+        label: Option<&str>,
+        is_free: bool,
+        quota_limit: i64,
+        price_per_1k_tokens: f64,
+    ) -> ProxyResult<i64> {
+        let max_priority: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(key_priority), 0) FROM channel_keys WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| ProxyError::Storage(e.to_string()))?;
+        let priority = (max_priority + 10) as i32;
+        self.create_key_full(
+            channel_id,
+            api_key,
+            label,
+            is_free,
+            priority,
+            quota_limit,
+            price_per_1k_tokens,
+        )
     }
 }
 

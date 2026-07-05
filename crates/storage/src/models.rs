@@ -2,6 +2,8 @@ use chennix_common::{BillingType, ChannelModelPricing, ModelBinding, ProxyError,
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+use crate::now_iso8601;
+
 pub struct ModelRepo<'a> {
     conn: &'a Connection,
 }
@@ -14,8 +16,8 @@ impl<'a> ModelRepo<'a> {
     pub fn create_model(&self, canonical_name: &str) -> ProxyResult<i64> {
         self.conn
             .execute(
-                "INSERT INTO models (canonical_name) VALUES (?1)",
-                params![canonical_name],
+                "INSERT INTO models (canonical_name, created_at) VALUES (?1, ?2)",
+                params![canonical_name, now_iso8601()],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(self.conn.last_insert_rowid())

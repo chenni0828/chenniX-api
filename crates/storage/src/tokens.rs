@@ -1,6 +1,7 @@
 use chennix_common::{AuthContext, ProxyError, ProxyResult, TokenConfig};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::now_iso8601;
 use crate::users::UserRepo;
 
 pub struct TokenRepo<'a> {
@@ -20,18 +21,21 @@ impl<'a> TokenRepo<'a> {
         remain_quota: i64,
         unlimited_quota: bool,
     ) -> ProxyResult<i64> {
+        let now = now_iso8601();
         self.conn
             .execute(
                 "INSERT INTO tokens (user_id, key, name, remain_quota, used_quota,
                                      unlimited_quota, expired_time, model_limits_enabled,
-                                     model_limits, status, allow_ips)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, -1, 0, NULL, 1, NULL)",
+                                     model_limits, status, allow_ips,
+                                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, -1, 0, NULL, 1, NULL, ?6, ?6)",
                 params![
                     user_id,
                     key,
                     name,
                     remain_quota,
                     if unlimited_quota { 1 } else { 0 },
+                    now,
                 ],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -93,9 +97,9 @@ impl<'a> TokenRepo<'a> {
     pub fn update_remain_quota_delta(&self, id: i64, delta: i64) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE tokens SET remain_quota = remain_quota + ?1, updated_at = datetime('now')
-                 WHERE id = ?2",
-                params![delta, id],
+                "UPDATE tokens SET remain_quota = remain_quota + ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![delta, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -105,9 +109,9 @@ impl<'a> TokenRepo<'a> {
     pub fn update_used_quota_delta(&self, id: i64, delta: i64) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE tokens SET used_quota = used_quota + ?1, updated_at = datetime('now')
-                 WHERE id = ?2",
-                params![delta, id],
+                "UPDATE tokens SET used_quota = used_quota + ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![delta, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -116,8 +120,8 @@ impl<'a> TokenRepo<'a> {
     pub fn update_status(&self, id: i64, status: i32) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE tokens SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![status, id],
+                "UPDATE tokens SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -146,9 +150,9 @@ impl<'a> TokenRepo<'a> {
         self.conn
             .execute(
                 "UPDATE tokens SET model_limits_enabled = ?1, model_limits = ?2,
-                                   updated_at = datetime('now')
-                 WHERE id = ?3",
-                params![if enabled { 1 } else { 0 }, json, id],
+                                   updated_at = ?3
+                 WHERE id = ?4",
+                params![if enabled { 1 } else { 0 }, json, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -232,12 +236,14 @@ impl<'a> TokenRepo<'a> {
             Some(allow_ips)
         };
         let name_val: Option<&str> = if name.is_empty() { None } else { Some(name) };
+        let now = now_iso8601();
         self.conn
             .execute(
                 "INSERT INTO tokens
                  (user_id, key, name, remain_quota, used_quota, unlimited_quota,
-                  expired_time, model_limits_enabled, model_limits, status, allow_ips)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, 1, ?9)",
+                  expired_time, model_limits_enabled, model_limits, status, allow_ips,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?10)",
                 params![
                     user_id,
                     key,
@@ -248,6 +254,7 @@ impl<'a> TokenRepo<'a> {
                     if model_limits_enabled { 1 } else { 0 },
                     model_limits_val,
                     allow_ips_val,
+                    now,
                 ],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -287,8 +294,8 @@ impl<'a> TokenRepo<'a> {
                 "UPDATE tokens
                  SET name = ?1, remain_quota = ?2, unlimited_quota = ?3,
                      expired_time = ?4, model_limits_enabled = ?5, model_limits = ?6,
-                     allow_ips = ?7, status = ?8, updated_at = datetime('now')
-                 WHERE id = ?9",
+                     allow_ips = ?7, status = ?8, updated_at = ?9
+                 WHERE id = ?10",
                 params![
                     name_val,
                     remain_quota,
@@ -298,6 +305,7 @@ impl<'a> TokenRepo<'a> {
                     model_limits_val,
                     allow_ips_val,
                     status,
+                    now_iso8601(),
                     id,
                 ],
             )

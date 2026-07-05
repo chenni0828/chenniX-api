@@ -446,7 +446,7 @@ pub struct CreateKeyRequest {
     pub api_key: String,
     pub label: Option<String>,
     pub is_free: bool,
-    pub priority: i32,
+    // priority 移除 — 由 create_key_auto_priority 自动分配 max+10
     pub quota_limit: i64,
     pub price_per_1k_tokens: f64,
 }
@@ -480,17 +480,28 @@ pub async fn create_key_handler(
     Path(channel_id): Path<i64>,
     Json(payload): Json<CreateKeyRequest>,
 ) -> AdminResult<Json<i64>> {
-    let db = state.db.lock().await;
-    let repo = KeyRepo::new(&db);
-    let id = repo.create_key_full(
-        channel_id,
-        &payload.api_key,
-        payload.label.as_deref(),
-        payload.is_free,
-        payload.priority,
-        payload.quota_limit,
-        payload.price_per_1k_tokens,
-    )?;
+    let id = {
+        let db = state.db.lock().await;
+        let repo = KeyRepo::new(&db);
+        // 同渠道内 api_key 唯一
+        let dup = repo
+            .count_duplicate_api_key_in_channel(channel_id, &payload.api_key, None)?;
+        if dup > 0 {
+            return Err(AdminError::BadRequest(format!(
+                "该渠道下已存在相同的 API Key"
+            )));
+        }
+        repo.create_key_auto_priority(
+            channel_id,
+            &payload.api_key,
+            payload.label.as_deref(),
+            payload.is_free,
+            payload.quota_limit,
+            payload.price_per_1k_tokens,
+        )?
+    };
+    // Invalidate cache so the new key is immediately visible to the router.
+    state.cache.invalidate().await;
     Ok(Json(id))
 }
 
@@ -513,17 +524,29 @@ pub async fn update_key_handler(
             )));
         }
     };
-    let db = state.db.lock().await;
-    let repo = KeyRepo::new(&db);
-    repo.update_key(
-        key_id,
-        &payload.api_key,
-        payload.is_free,
-        payload.priority,
-        payload.quota_limit,
-        payload.price_per_1k_tokens,
-        status_i32,
-    )?;
+    {
+        let db = state.db.lock().await;
+        let repo = KeyRepo::new(&db);
+        // 同渠道内 api_key 唯一（编辑时排除自身）
+        let dup = repo
+            .count_duplicate_api_key_in_channel(channel_id, &payload.api_key, Some(key_id))?;
+        if dup > 0 {
+            return Err(AdminError::BadRequest(format!(
+                "该渠道下已存在相同的 API Key"
+            )));
+        }
+        repo.update_key(
+            key_id,
+            &payload.api_key,
+            payload.is_free,
+            payload.priority,
+            payload.quota_limit,
+            payload.price_per_1k_tokens,
+            status_i32,
+        )?;
+    }
+    // Invalidate cache so the updated key status/priority takes effect immediately.
+    state.cache.invalidate().await;
     Ok(Json(()))
 }
 
@@ -533,9 +556,13 @@ pub async fn delete_key_handler(
     Path((channel_id, key_id)): Path<(i64, i64)>,
 ) -> AdminResult<Json<()>> {
     let _ = channel_id;
-    let db = state.db.lock().await;
-    let repo = KeyRepo::new(&db);
-    repo.delete_key(key_id)?;
+    {
+        let db = state.db.lock().await;
+        let repo = KeyRepo::new(&db);
+        repo.delete_key(key_id)?;
+    }
+    // Invalidate cache so the deleted key is no longer routed to.
+    state.cache.invalidate().await;
     Ok(Json(()))
 }
 
@@ -548,6 +575,29 @@ pub async fn reset_key_quota_handler(
     let key_repo = KeyRepo::new(&db);
     key_repo.reset_key_quota(key_id, channel_id)?;
     Ok(Json(serde_json::json!({ "success": true, "message": "Quota reset" })))
+}
+
+/// `PUT /admin/api/channels/:id/keys/reorder` — 重排渠道下 key 的优先级。
+/// `key_ids` 按调用优先级从高到低排列（索引 0 = 最高优先级）。
+/// priority 按位置赋值为 `(i+1)*10`。
+#[derive(Debug, Deserialize)]
+pub struct ReorderKeysRequest {
+    pub key_ids: Vec<i64>,
+}
+
+pub async fn reorder_keys_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<i64>,
+    Json(payload): Json<ReorderKeysRequest>,
+) -> AdminResult<Json<serde_json::Value>> {
+    {
+        let db = state.db.lock().await;
+        let repo = KeyRepo::new(&db);
+        repo.reorder_keys(channel_id, &payload.key_ids)?;
+    }
+    // Invalidate cache so the new call order takes effect immediately.
+    state.cache.invalidate().await;
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 // ======================================================================
@@ -652,12 +702,22 @@ pub async fn list_models_handler(State(state): State<AppState>) -> AdminResult<J
 ///
 /// 仅创建 `models` 行（`routing_strategy` 走 schema 默认值 `'priority'`），
 /// 返回完整 model 对象（含 `id`、`canonical_name`、`routing_strategy`）。
+///
+/// 重名时返回 400 Bad Request（错误信息中文友好提示），避免直接透出
+/// SQLite 的 `UNIQUE constraint failed` 原始文本。
 pub async fn create_model_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateModelRequest>,
 ) -> AdminResult<Json<ModelDetail>> {
     let db = state.db.lock().await;
     let repo = ModelRepo::new(&db);
+    // 提前检查重名：canonical_name 在 models 表中唯一
+    if repo.get_model_by_name(&payload.canonical_name)?.is_some() {
+        return Err(AdminError::BadRequest(format!(
+            "模型名「{}」已存在，请使用其他名称",
+            payload.canonical_name
+        )));
+    }
     let id = repo.create_model(&payload.canonical_name)?;
     Ok(Json(ModelDetail {
         id,
@@ -692,6 +752,9 @@ pub async fn update_routing_strategy_handler(
 }
 
 /// `PUT /admin/api/models/:id`
+///
+/// 重命名时提前检查目标名称是否已被其他模型占用，避免直接透出 SQLite
+/// 的 `UNIQUE constraint failed` 原始文本。
 pub async fn update_model_handler(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -699,6 +762,14 @@ pub async fn update_model_handler(
 ) -> AdminResult<Json<()>> {
     let db = state.db.lock().await;
     let repo = ModelRepo::new(&db);
+    if let Some((existing_id, _)) = repo.get_model_by_name(&payload.canonical_name)? {
+        if existing_id != id {
+            return Err(AdminError::BadRequest(format!(
+                "模型名「{}」已存在，请使用其他名称",
+                payload.canonical_name
+            )));
+        }
+    }
     repo.rename_model(id, &payload.canonical_name)?;
     Ok(Json(()))
 }
@@ -945,6 +1016,7 @@ async fn record_test_log(
     key_label: Option<&str>,
     path: &str,
     upstream_status: Option<i64>,
+    upstream_model: Option<&str>,
     success: bool,
     latency_ms: u64,
     error: Option<&str>,
@@ -976,6 +1048,7 @@ async fn record_test_log(
             key_label,
             None,
             upstream_status,
+            upstream_model,
             response_status,
             latency_ms as i64,
             false,
@@ -1141,6 +1214,7 @@ pub async fn test_channel_handler(
             key_label.as_deref(),
             &log_path,
             upstream_status,
+            Some(test_model.as_str()),
             result.success,
             result.latency_ms,
             result.error.as_deref(),
@@ -1200,6 +1274,7 @@ pub async fn test_channel_handler(
             &channel_name,
             key_label.as_deref(),
             &log_path,
+            None,
             None,
             result.success,
             result.latency_ms,
@@ -1343,6 +1418,7 @@ pub async fn test_model_handler(
         key_label.as_deref(),
         &log_path,
         upstream_status,
+        Some(&upstream_model_name),
         result.success,
         result.latency_ms,
         result.error.as_deref(),
@@ -1500,6 +1576,7 @@ pub async fn test_binding_handler(
         key_label.as_deref(),
         &log_path,
         upstream_status,
+        Some(&upstream_model_name),
         result.success,
         result.latency_ms,
         result.error.as_deref(),

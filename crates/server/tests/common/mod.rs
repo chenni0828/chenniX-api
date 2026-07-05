@@ -571,6 +571,20 @@ pub fn get_first_usage_log(conn: &Connection) -> (i64, i64, i64, i64) {
     .unwrap()
 }
 
+/// Get (user_id, token_id, key_id, quota_cost) from the usage_log row with
+/// the given `status` ('success' / 'failed'). Returns `None` if no match.
+pub fn get_usage_log_by_status(
+    conn: &Connection,
+    status: &str,
+) -> Option<(i64, i64, i64, i64)> {
+    conn.query_row(
+        "SELECT user_id, token_id, key_id, quota_cost FROM usage_logs WHERE status = ?1 ORDER BY id LIMIT 1",
+        params![status],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .ok()
+}
+
 /// Set a user's quota to a specific value.
 pub fn set_user_quota(conn: &Connection, user_id: i64, quota: i64) {
     conn.execute(

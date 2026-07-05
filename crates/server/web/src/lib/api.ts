@@ -14,6 +14,14 @@ api.interceptors.response.use(
         window.location.href = '/admin/login'
       }
     }
+    // 后端 AdminError 返回 { error, code }，前端各处统一读 data.message。
+    // 在此把 error 字段映射到 message，避免每处都改读取字段。
+    if (error.response?.data && typeof error.response.data === 'object') {
+      const data = error.response.data as Record<string, unknown>
+      if (data.message === undefined && typeof data.error === 'string') {
+        data.message = data.error
+      }
+    }
     return Promise.reject(error)
   }
 )

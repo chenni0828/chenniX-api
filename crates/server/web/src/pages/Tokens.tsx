@@ -158,7 +158,7 @@ export default function Tokens() {
       const data = await tokenApi.list(userId)
       setTokens(data)
     } catch (err) {
-      setError(getErrorMessage(err, "加载 Token 列表失败"))
+      setError(getErrorMessage(err, "加载令牌列表失败"))
     } finally {
       setLoading(false)
     }
@@ -215,7 +215,7 @@ export default function Tokens() {
 
   const handleCreate = async () => {
     if (!createForm.name) {
-      toast({ title: "请输入 Token 名称", variant: "destructive" })
+      toast({ title: "请输入令牌名称", variant: "destructive" })
       return
     }
     setSubmitting(true)
@@ -235,7 +235,7 @@ export default function Tokens() {
         ? parseInt(createForm.assign_user_id) || undefined
         : undefined
       await tokenApi.create(payload, assignUserId)
-      toast({ title: "Token 创建成功" })
+      toast({ title: "令牌创建成功" })
       setCreateOpen(false)
       setCreateForm({
         name: "", assign_user_id: "", remain_quota: "10", unlimited_quota: false,
@@ -286,7 +286,7 @@ export default function Tokens() {
         status: parseInt(editForm.status),
       }
       await tokenApi.update(editTarget.id, payload)
-      toast({ title: "Token 更新成功" })
+      toast({ title: "令牌更新成功" })
       setEditTarget(null)
       fetchTokens()
     } catch (err) {
@@ -302,7 +302,7 @@ export default function Tokens() {
     setSubmitting(true)
     try {
       await tokenApi.delete(deleteTarget.id)
-      toast({ title: "Token 已删除" })
+      toast({ title: "令牌已删除" })
       setDeleteTarget(null)
       fetchTokens()
     } catch (err) {
@@ -327,7 +327,7 @@ export default function Tokens() {
           </Button>
           <Button size="sm" onClick={() => setCreateOpen(true)}>
             <Plus className="h-4 w-4" />
-            新建 Token
+            新建令牌
           </Button>
         </div>
       </div>
@@ -362,7 +362,7 @@ export default function Tokens() {
             </div>
           ) : tokens.length === 0 ? (
             <div className="flex items-center justify-center py-16 text-sm text-muted-foreground">
-              暂无 Token 数据
+              暂无令牌数据
             </div>
           ) : (
             <Table>
@@ -443,7 +443,7 @@ export default function Tokens() {
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="max-h-[90vh] max-w-lg overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>新建 Token</DialogTitle>
+            <DialogTitle>新建令牌</DialogTitle>
             <DialogDescription>创建一个新的 API 访问令牌</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -451,7 +451,7 @@ export default function Tokens() {
               <Label htmlFor="ct-name">名称</Label>
               <Input id="ct-name" value={createForm.name}
                 onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
-                placeholder="输入 Token 名称" />
+                placeholder="输入令牌名称" />
             </div>
             {isAdmin && (
               <div className="space-y-2">
@@ -519,8 +519,8 @@ export default function Tokens() {
       <Dialog open={!!editTarget} onOpenChange={(v) => !v && setEditTarget(null)}>
         <DialogContent className="max-h-[90vh] max-w-lg overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>编辑 Token</DialogTitle>
-            <DialogDescription>修改 Token 信息</DialogDescription>
+            <DialogTitle>编辑令牌</DialogTitle>
+            <DialogDescription>修改令牌信息</DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
             <div className="space-y-2">
@@ -592,7 +592,7 @@ export default function Tokens() {
           <DialogHeader>
             <DialogTitle>确认删除</DialogTitle>
             <DialogDescription>
-              确定要删除 Token <span className="font-semibold text-foreground">{deleteTarget?.name || deleteTarget?.key.slice(0, 10) + "..."}</span> 吗？此操作不可撤销。
+              确定要删除令牌 <span className="font-semibold text-foreground">{deleteTarget?.name || deleteTarget?.key.slice(0, 10) + "..."}</span> 吗？此操作不可撤销。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

@@ -3,18 +3,25 @@
 //!
 //! ## Non-streaming (`execute`)
 //! 1. Resolve cached channels + keys for the model.
-//! 2. `Router::route` → flat sorted candidate list.
-//! 3. `BillingManager::pre_charge` (estimate).
-//! 4. For each candidate key (in order):
-//!    a. Skip if `HealthManager::is_available` is false.
-//!    b. Build the outgoing body (same-format → swap `model`; cross-format →
-//!       translate via `chennix-translator`, then swap `model`).
-//!    c. Call the appropriate `Adaptor`.
-//!    d. On success: extract usage, settle billing, track success, return.
-//!    e. On retryable upstream error (429/5xx/network): mark cooldown, next.
-//!    f. On fatal upstream error (401/403): mark disabled, next.
-//!    g. On invalid_request (400/422): refund + return immediately.
-//! 5. If all keys exhausted: refund + return `AllKeysExhausted`.
+//! 2. `Router::route` → binding-grouped candidate list `Vec<Vec<RoutedKey>>`
+//!    (outer = binding, inner = key).
+//! 3. `BillingManager::pre_charge` (estimate, against first binding's first key).
+//! 4. Two-layer loop, capped at `MAX_BINDING_ATTEMPTS` bindings:
+//!    - **Outer (binding)**: try up to 3 bindings in route order.
+//!    - **Inner (key)**: for each key in the binding (in `key_priority` order):
+//!      a. Skip if `HealthManager::is_available` is false.
+//!      b. Build the outgoing body (same-format → swap `model`; cross-format →
+//!         translate via `chennix-translator`, then swap `model`).
+//!      c. Call the appropriate `Adaptor`.
+//!      d. On success: extract usage, settle billing, track success, return.
+//!      e. On `Cooldown`-class error (429/5xx/network): mark cooldown, next key.
+//!      f. On `Disable`-class error (401/403): mark disabled, next key.
+//!      g. On `SkipBinding` (404 / context_length_exceeded): break inner loop,
+//!         jump to next binding. Key is NOT cooled down — the key is fine,
+//!         the upstream model is unsuitable for this request.
+//!      h. On `ReturnToClient` (400/422 other than context_length_exceeded):
+//!         refund + return immediately.
+//! 5. If all bindings exhausted: refund + return `AllKeysExhausted`.
 //!
 //! ## Streaming (`execute_stream`)
 //! Same as above through step (c), but the per-key "call adaptor" step
@@ -65,6 +72,10 @@ pub struct ExecutionContext {
     pub canonical_name: String,
 }
 
+/// Binding 层最大尝试次数（包含首次），超出后返回 AllKeysExhausted。
+/// 每个 binding 内会尝试所有可用 key 至全部失败，然后才进入下一个 binding。
+const MAX_BINDING_ATTEMPTS: usize = 3;
+
 pub struct Executor {
     pub health: Arc<HealthManager>,
     pub cache: Arc<ConfigCache>,
@@ -79,32 +90,55 @@ pub struct Executor {
 /// What the executor should do after a key attempt fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FailureAction {
-    /// Cooldown the key and try the next candidate.
+    /// Cooldown the key and try the next candidate (429/5xx/network).
     Cooldown,
     /// Disable the key (e.g. 401/403) and try the next candidate.
     Disable,
-    /// Refund billing and surface the error to the client immediately.
+    /// Refund billing and surface the error to the client immediately
+    /// (400/422 other than context_length_exceeded).
     ReturnToClient,
+    /// Skip to the next binding without cooling down the current key.
+    /// Used for 404 (model not found at upstream) and context_length_exceeded
+    /// (400 with `context_length_exceeded` in the body) — the key is fine,
+    /// but the current binding's upstream model is unsuitable for this request.
+    /// A different binding may use a different upstream model with a larger
+    /// context window or different availability.
+    SkipBinding,
 }
 
 /// Classify an upstream error into the executor's next action.
 ///
-/// - `is_invalid_request` (400/422 / `InvalidRequest`) → `ReturnToClient`
-///   (the request itself is bad; no point trying other keys).
-/// - `is_fatal` (401/403) → `Disable` (key is bad; don't retry it).
-/// - `is_retryable` (429/5xx) → `Cooldown` (transient; try next).
-/// - Anything else (e.g. `Http` network error, `Translator`) → `Cooldown`
-///   (be optimistic; try the next key).
+/// - `Upstream { 404, .. }` → `SkipBinding` (model not found at this upstream;
+///   other keys in the same binding use the same upstream model → same 404).
+/// - `Upstream { 400, body }` with `context_length_exceeded` in body →
+///   `SkipBinding` (request too long for this upstream model; a different
+///   binding may have a larger context window).
+/// - `Upstream { 400 | 422, .. }` (other) → `ReturnToClient` (bad request).
+/// - `Upstream { 401 | 403, .. }` → `Disable` (key is bad).
+/// - `Upstream { 429/5xx/.. }` → `Cooldown` (transient; try next key).
+/// - `UpstreamTimeout` → `Cooldown`.
+/// - `InvalidRequest` → `ReturnToClient`.
+/// - Anything else (Http/Translator/unknown) → `Cooldown`.
 fn classify_failure(e: &ProxyError) -> FailureAction {
-    if e.is_invalid_request() {
-        FailureAction::ReturnToClient
-    } else if e.is_fatal() {
-        FailureAction::Disable
-    } else {
-        // retryable Upstream, Http network errors, Translator errors,
-        // unknown — all treated as "try the next key".
-        FailureAction::Cooldown
+    match e {
+        ProxyError::Upstream { status, body } => match *status {
+            404 => FailureAction::SkipBinding,
+            400 if body_contains_context_length_exceeded(body) => FailureAction::SkipBinding,
+            400 | 422 => FailureAction::ReturnToClient,
+            401 | 403 => FailureAction::Disable,
+            _ => FailureAction::Cooldown,
+        },
+        ProxyError::InvalidRequest(_) => FailureAction::ReturnToClient,
+        ProxyError::UpstreamTimeout(_) => FailureAction::Cooldown,
+        _ => FailureAction::Cooldown,
     }
+}
+
+/// Detect whether an upstream 400 error body indicates a context-length
+/// overflow. OpenAI returns `{"error":{"code":"context_length_exceeded",...}}`.
+/// Uses case-insensitive substring matching to tolerate provider variants.
+fn body_contains_context_length_exceeded(body: &str) -> bool {
+    body.to_lowercase().contains("context_length_exceeded")
 }
 
 /// Estimate the pre-charge cost for a single request.
@@ -320,10 +354,67 @@ pub struct ExecutionResult {
     pub key_label: Option<String>,
     /// Upstream HTTP status code (None if the adaptor did not expose one).
     pub upstream_status: Option<i64>,
+    /// 实际命中的上游模型名（绑定时配置的 upstream_model_name）。
+    pub upstream_model_name: String,
     /// Actual cost in the storage unit (micro-yuan).
     pub quota_cost: i64,
     /// All key labels attempted before success (for audit).
     pub attempted_keys: Vec<String>,
+}
+
+/// 失败时回传给 handler 的审计上下文，与 `ExecutionResult` 对称。
+///
+/// `execute` 失败路径（单 key ReturnToClient / AllKeysExhausted /
+/// Translator 错误等）会返回此结构，使 handler 能在写 `request_logs`
+/// 审计行时填入 channel_name / key_label / upstream_model_name /
+/// attempted_keys / upstream_status 等字段——之前因 executor 只返回
+/// `ProxyError` 而丢失这些信息，导致失败请求的审计日志「缺渠道、缺
+/// 具体模型」。
+#[derive(Debug)]
+pub struct ExecutionFailure {
+    /// 最后一次尝试的渠道名（用于审计日志）。
+    pub channel_name: Option<String>,
+    /// 最后一次尝试的 key label。
+    pub key_label: Option<String>,
+    /// 全部尝试过的 key label（CSV 用）。
+    pub attempted_keys: Vec<String>,
+    /// 最后一次上游返回的 HTTP 状态码（无上游响应则为 None）。
+    pub upstream_status: Option<i64>,
+    /// 最后一次尝试的 upstream_model_name（具体调用的模型）。
+    pub upstream_model_name: Option<String>,
+    /// 原始错误，handler 用它构造客户端响应。
+    pub error: ProxyError,
+}
+
+impl ExecutionFailure {
+    /// 构造一个「无任何 key 被尝试」的失败（如 candidates 为空）。
+    fn no_attempt(error: ProxyError) -> Self {
+        Self {
+            channel_name: None,
+            key_label: None,
+            attempted_keys: Vec::new(),
+            upstream_status: None,
+            upstream_model_name: None,
+            error,
+        }
+    }
+
+    /// 用最后一次尝试的 key 信息 + 原始错误构造。
+    fn from_last_attempt(
+        rk: &RoutedKey,
+        attempted: Vec<String>,
+        upstream_status: Option<i64>,
+        error: ProxyError,
+    ) -> Self {
+        Self {
+            channel_name: Some(rk.channel.name.clone()),
+            key_label: rk.key.label.clone(),
+            attempted_keys: attempted,
+            upstream_status,
+            upstream_model_name: Some(rk.upstream_model_name.clone()),
+            error,
+        }
+    }
 }
 
 /// Bootstrap result returned by `execute_stream`. The upstream has accepted
@@ -376,14 +467,15 @@ impl Executor {
         }
     }
 
-    /// Resolve the routed candidate keys for a request, in the order the
-    /// executor should attempt them. Extracted as a standalone method so
-    /// tests can verify routing without spinning up upstream HTTP servers.
+    /// Resolve the routed candidate keys for a request, as a binding-grouped
+    /// list `Vec<Vec<RoutedKey>>` (outer = binding, inner = key). Extracted
+    /// as a standalone method so tests can verify routing without spinning
+    /// up upstream HTTP servers.
     pub async fn select_keys(
         &self,
         ctx: &ExecutionContext,
         cache_loader: &dyn crate::cache::CacheLoader,
-    ) -> ProxyResult<Vec<RoutedKey>> {
+    ) -> ProxyResult<Vec<Vec<RoutedKey>>> {
         // NOTE: do NOT call `check_recoveries()` here.
         //
         // `is_available` already checks `cooldown_until > Utc::now()` inline,
@@ -429,6 +521,10 @@ impl Executor {
     }
 
     /// Non-streaming execution. See module docs for the full flow.
+    ///
+    /// 成功返回 `ExecutionResult`；失败返回 `ExecutionFailure`（携带最后
+    /// 一次尝试的渠道/key/上游模型等审计上下文，便于 handler 写完整
+    /// `request_logs` 行）。
     pub async fn execute(
         &self,
         ctx: &ExecutionContext,
@@ -437,44 +533,60 @@ impl Executor {
         billing_repo: &dyn BillingRepo,
         usage_writer: &dyn UsageWriter,
         cache_loader: &dyn crate::cache::CacheLoader,
-    ) -> ProxyResult<ExecutionResult> {
-        let candidates = self.select_keys(ctx, cache_loader).await?;
+    ) -> Result<ExecutionResult, ExecutionFailure> {
+        let candidates = match self.select_keys(ctx, cache_loader).await {
+            Ok(v) => v,
+            Err(e) => return Err(ExecutionFailure::no_attempt(e)),
+        };
         if candidates.is_empty() {
-            return Err(ProxyError::AllKeysExhausted {
+            return Err(ExecutionFailure::no_attempt(ProxyError::AllKeysExhausted {
                 model: ctx.canonical_name.clone(),
                 attempted_keys: Vec::new(),
                 last_error: None,
-            });
+            }));
         }
 
         // Pre-charge against the *first* candidate's key — this is the key
         // we expect to use. If we end up using a different key, settle will
         // still true up against actual usage; the per-binding price only
         // affects the *actual_cost* computation, not the pre-charge.
-        let model_pricing = self
+        let model_pricing = match self
             .cache
             .get_channel_model_pricing(
                 ctx.model_id,
-                candidates[0].channel.id,
-                &candidates[0].upstream_model_name,
+                candidates[0][0].channel.id,
+                &candidates[0][0].upstream_model_name,
                 cache_loader,
             )
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Err(ExecutionFailure::no_attempt(e)),
+        };
         let max_tokens = extract_max_tokens(&body, entry_format);
         let estimated = estimate_cost(model_pricing.as_ref(), max_tokens);
-        let mut session = BillingManager::pre_charge(
+        let mut session = match BillingManager::pre_charge(
             billing_repo, ctx.user_id, ctx.token_id, estimated,
         )
-        .await?;
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => return Err(ExecutionFailure::no_attempt(e)),
+        };
 
         let mut attempted: Vec<String> = Vec::new();
         let mut last_error: Option<String> = None;
+        let mut last_upstream_status: Option<i64> = None;
+        let mut last_tried_rk: Option<&RoutedKey> = None;
 
-        for rk in &candidates {
+        for binding in candidates.iter().take(MAX_BINDING_ATTEMPTS) {
+            for rk in binding {
             // Re-check availability (async, authoritative).
             if !self.health.is_available(rk.key.id).await {
                 continue;
             }
+
+            last_tried_rk = Some(rk);
 
             let label = rk
                 .key
@@ -492,8 +604,17 @@ impl Executor {
                 Ok(v) => v,
                 Err(e) => {
                     // Translator error — surface to client, refund.
-                    BillingManager::refund(billing_repo, session).await?;
-                    return Err(e);
+                    if let Err(refund_err) =
+                        BillingManager::refund(billing_repo, session).await
+                    {
+                        tracing::error!("refund after translator error failed: {}", refund_err);
+                    }
+                    return Err(ExecutionFailure::from_last_attempt(
+                        rk,
+                        attempted,
+                        None,
+                        e,
+                    ));
                 }
             };
 
@@ -506,16 +627,32 @@ impl Executor {
                 req_body,
                 HashMap::new(),
             );
-            let exec_result = tokio::time::timeout(self.upstream_timeout, exec_fut)
-                .await
-                .map_err(|_| {
+            let exec_result = match tokio::time::timeout(self.upstream_timeout, exec_fut).await {
+                Ok(r) => r,
+                Err(_) => {
                     tracing::warn!(
                         key_id = rk.key.id,
                         timeout_secs = self.upstream_timeout.as_secs(),
                         "upstream request timed out"
                     );
-                    ProxyError::UpstreamTimeout(self.upstream_timeout)
-                })?;
+                    let timeout_err = ProxyError::UpstreamTimeout(self.upstream_timeout);
+                    last_error = Some(timeout_err.to_string());
+                    last_upstream_status = None;
+                    let _ = Tracker::track_failure(
+                        usage_writer,
+                        ctx.user_id,
+                        ctx.token_id,
+                        rk.channel.id,
+                        rk.key.id,
+                        ctx.model_id,
+                        "chat",
+                        &timeout_err.to_string(),
+                    )
+                    .await;
+                    self.health.mark_cooldown(rk.key.id).await;
+                    continue;
+                }
+            };
             match exec_result {
                 Ok((upstream_status_code, bytes)) => {
                     // Extract usage from the upstream-native response.
@@ -525,19 +662,32 @@ impl Executor {
                         extract_usage_from_response(&usage_value, adaptor_provider);
                     // 实际命中的渠道可能不同于预扣时的第一个候选，需重新取该绑定的定价。
                     // 三元组定价下，channel 相同但 upstream 不同也算不同绑定，需一并比较。
-                    let actual_pricing = if rk.channel.id == candidates[0].channel.id
-                        && rk.upstream_model_name == candidates[0].upstream_model_name
+                    let actual_pricing = if rk.channel.id == candidates[0][0].channel.id
+                        && rk.upstream_model_name == candidates[0][0].upstream_model_name
                     {
                         model_pricing.clone()
                     } else {
-                        self.cache
+                        match self
+                            .cache
                             .get_channel_model_pricing(
                                 ctx.model_id,
                                 rk.channel.id,
                                 &rk.upstream_model_name,
                                 cache_loader,
                             )
-                            .await?
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // 计价查询失败但响应已拿到——按 0 成本结算，
+                                // best-effort 记账，不影响响应返回。
+                                tracing::error!(
+                                    "get_channel_model_pricing failed after upstream success: {}",
+                                    e
+                                );
+                                None
+                            }
+                        }
                     };
                     let cost = actual_cost(&usage, actual_pricing.as_ref());
 
@@ -578,15 +728,34 @@ impl Executor {
                     let final_body = if adaptor_provider == entry_format.provider() {
                         bytes
                     } else {
-                        let translated =
-                            translate_response_back(entry_format, adaptor_provider, usage_value)?;
-                        Bytes::from(serde_json::to_vec(&translated)?)
+                        match translate_response_back(entry_format, adaptor_provider, usage_value) {
+                            Ok(t) => match serde_json::to_vec(&t) {
+                                Ok(v) => Bytes::from(v),
+                                Err(e) => {
+                                    return Err(ExecutionFailure::from_last_attempt(
+                                        rk,
+                                        attempted,
+                                        Some(upstream_status_code as i64),
+                                        ProxyError::Json(e),
+                                    ));
+                                }
+                            },
+                            Err(e) => {
+                                return Err(ExecutionFailure::from_last_attempt(
+                                    rk,
+                                    attempted,
+                                    Some(upstream_status_code as i64),
+                                    e,
+                                ));
+                            }
+                        }
                     };
                     return Ok(ExecutionResult {
                         body: final_body,
                         channel_name: rk.channel.name.clone(),
                         key_label: rk.key.label.clone(),
                         upstream_status: Some(upstream_status_code as i64),
+                        upstream_model_name: rk.upstream_model_name.clone(),
                         quota_cost: cost,
                         attempted_keys: attempted.clone(),
                     });
@@ -606,11 +775,28 @@ impl Executor {
                         &err_str,
                     )
                     .await;
+                    let upstream_status = match &e {
+                        ProxyError::Upstream { status, .. } => Some(*status as i64),
+                        _ => None,
+                    };
+                    last_upstream_status = upstream_status;
                     match classify_failure(&e) {
                         FailureAction::ReturnToClient => {
                             // 400/422 — bad request. Refund + return.
-                            BillingManager::refund(billing_repo, session).await?;
-                            return Err(e);
+                            if let Err(refund_err) =
+                                BillingManager::refund(billing_repo, session).await
+                            {
+                                tracing::error!(
+                                    "refund after ReturnToClient failure failed: {}",
+                                    refund_err
+                                );
+                            }
+                            return Err(ExecutionFailure::from_last_attempt(
+                                rk,
+                                attempted,
+                                upstream_status,
+                                e,
+                            ));
                         }
                         FailureAction::Disable => {
                             self.health.mark_disabled(rk.key.id).await;
@@ -620,18 +806,51 @@ impl Executor {
                             self.health.mark_cooldown(rk.key.id).await;
                             continue;
                         }
+                        FailureAction::SkipBinding => {
+                            // key 本身没问题（404/context_length_exceeded），跳到下一个 binding
+                            break;
+                        }
                     }
                 }
+            }
             }
         }
 
         // All keys exhausted. Refund the pre-charge.
-        BillingManager::refund(billing_repo, session).await?;
-        Err(ProxyError::AllKeysExhausted {
-            model: ctx.canonical_name.clone(),
-            attempted_keys: attempted,
-            last_error,
-        })
+        if let Err(refund_err) = BillingManager::refund(billing_repo, session).await {
+            tracing::error!("refund after all keys exhausted failed: {}", refund_err);
+        }
+        // 若有 key 被尝试过，用最后实际尝试的 key 填充审计上下文。
+        // （last_tried_rk 跟踪循环中最后尝试的 key，比 candidates.last() 更准确
+        //   —— SkipBinding 会跳过 key，最后排序的 key 不等于最后尝试的 key）
+        let last_rk = last_tried_rk;
+        let mut failure = match last_rk {
+            Some(rk) => ExecutionFailure::from_last_attempt(
+                rk,
+                attempted,
+                last_upstream_status,
+                ProxyError::AllKeysExhausted {
+                    model: ctx.canonical_name.clone(),
+                    attempted_keys: Vec::new(),
+                    last_error: last_error.clone(),
+                },
+            ),
+            None => ExecutionFailure::no_attempt(ProxyError::AllKeysExhausted {
+                model: ctx.canonical_name.clone(),
+                attempted_keys: Vec::new(),
+                last_error: last_error.clone(),
+            }),
+        };
+        // AllKeysExhausted 自身已含 attempted_keys，覆盖 from_last_attempt
+        // 中可能为空的 attempted 字段，保持错误 Display 信息完整。
+        if let ProxyError::AllKeysExhausted {
+            attempted_keys: ref mut ak,
+            ..
+        } = &mut failure.error
+        {
+            *ak = failure.attempted_keys.clone();
+        }
+        Err(failure)
     }
 
     /// Streaming execution. The executor establishes the upstream
@@ -639,6 +858,9 @@ impl Executor {
     /// the upstream has accepted the request. Per-chunk forwarding,
     /// usage extraction, billing settlement, and tracking happen in the
     /// HTTP handler (Task 25/26).
+    ///
+    /// 失败返回 `ExecutionFailure`（与非流式一致），便于 handler 写完整
+    /// `request_logs` 审计行。
     pub async fn execute_stream(
         &self,
         ctx: &ExecutionContext,
@@ -647,39 +869,55 @@ impl Executor {
         billing_repo: &dyn BillingRepo,
         usage_writer: &dyn UsageWriter,
         cache_loader: &dyn crate::cache::CacheLoader,
-    ) -> ProxyResult<StreamBootstrap> {
-        let candidates = self.select_keys(ctx, cache_loader).await?;
+    ) -> Result<StreamBootstrap, ExecutionFailure> {
+        let candidates = match self.select_keys(ctx, cache_loader).await {
+            Ok(v) => v,
+            Err(e) => return Err(ExecutionFailure::no_attempt(e)),
+        };
         if candidates.is_empty() {
-            return Err(ProxyError::AllKeysExhausted {
+            return Err(ExecutionFailure::no_attempt(ProxyError::AllKeysExhausted {
                 model: ctx.canonical_name.clone(),
                 attempted_keys: Vec::new(),
                 last_error: None,
-            });
+            }));
         }
 
-        let model_pricing = self
+        let model_pricing = match self
             .cache
             .get_channel_model_pricing(
                 ctx.model_id,
-                candidates[0].channel.id,
-                &candidates[0].upstream_model_name,
+                candidates[0][0].channel.id,
+                &candidates[0][0].upstream_model_name,
                 cache_loader,
             )
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return Err(ExecutionFailure::no_attempt(e)),
+        };
         let max_tokens = extract_max_tokens(&body, entry_format);
         let estimated = estimate_cost(model_pricing.as_ref(), max_tokens);
-        let session = BillingManager::pre_charge(
+        let session = match BillingManager::pre_charge(
             billing_repo, ctx.user_id, ctx.token_id, estimated,
         )
-        .await?;
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => return Err(ExecutionFailure::no_attempt(e)),
+        };
 
         let mut attempted: Vec<String> = Vec::new();
         let mut last_error: Option<String> = None;
+        let mut last_upstream_status: Option<i64> = None;
+        let mut last_tried_rk: Option<&RoutedKey> = None;
 
-        for rk in &candidates {
+        for binding in candidates.iter().take(MAX_BINDING_ATTEMPTS) {
+            for rk in binding {
             if !self.health.is_available(rk.key.id).await {
                 continue;
             }
+
+            last_tried_rk = Some(rk);
 
             let label = rk
                 .key
@@ -696,8 +934,17 @@ impl Executor {
             ) {
                 Ok(v) => v,
                 Err(e) => {
-                    BillingManager::refund(billing_repo, session).await?;
-                    return Err(e);
+                    if let Err(refund_err) =
+                        BillingManager::refund(billing_repo, session).await
+                    {
+                        tracing::error!("refund after translator error failed: {}", refund_err);
+                    }
+                    return Err(ExecutionFailure::from_last_attempt(
+                        rk,
+                        attempted,
+                        None,
+                        e,
+                    ));
                 }
             };
 
@@ -711,16 +958,32 @@ impl Executor {
                 req_body,
                 HashMap::new(),
             );
-            let exec_result = tokio::time::timeout(self.streaming_timeout, exec_fut)
-                .await
-                .map_err(|_| {
+            let exec_result = match tokio::time::timeout(self.streaming_timeout, exec_fut).await {
+                Ok(r) => r,
+                Err(_) => {
                     tracing::warn!(
                         key_id = rk.key.id,
                         timeout_secs = self.streaming_timeout.as_secs(),
                         "streaming first-byte timed out"
                     );
-                    ProxyError::UpstreamTimeout(self.streaming_timeout)
-                })?;
+                    let timeout_err = ProxyError::UpstreamTimeout(self.streaming_timeout);
+                    last_error = Some(timeout_err.to_string());
+                    last_upstream_status = None;
+                    let _ = Tracker::track_failure(
+                        usage_writer,
+                        ctx.user_id,
+                        ctx.token_id,
+                        rk.channel.id,
+                        rk.key.id,
+                        ctx.model_id,
+                        "chat",
+                        &timeout_err.to_string(),
+                    )
+                    .await;
+                    self.health.mark_cooldown(rk.key.id).await;
+                    continue;
+                }
+            };
             match exec_result {
                 Ok(resp) => {
                     // Bootstrap boundary crossed: the upstream has accepted
@@ -732,11 +995,41 @@ impl Executor {
                     //
                     // NOTE: billing is NOT settled here; the caller must do
                     // it once the stream finishes (or errors out).
+                    //
+                    // 实际命中的渠道可能不同于预扣时的第一个候选，需重新取该绑定的定价。
+                    // 三元组定价下，channel 相同但 upstream 不同也算不同绑定，需一并比较。
+                    let actual_pricing = if rk.channel.id == candidates[0][0].channel.id
+                        && rk.upstream_model_name == candidates[0][0].upstream_model_name
+                    {
+                        model_pricing.clone()
+                    } else {
+                        match self
+                            .cache
+                            .get_channel_model_pricing(
+                                ctx.model_id,
+                                rk.channel.id,
+                                &rk.upstream_model_name,
+                                cache_loader,
+                            )
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // 计价查询失败但响应已拿到——按 None 结算，
+                                // best-effort 记账，不影响流式响应返回。
+                                tracing::error!(
+                                    "get_channel_model_pricing failed after stream bootstrap: {}",
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    };
                     return Ok(StreamBootstrap {
                         response: resp,
                         session,
                         routed_key: rk.clone(),
-                        model_pricing,
+                        model_pricing: actual_pricing,
                         entry_format,
                         adaptor_provider,
                     });
@@ -756,10 +1049,27 @@ impl Executor {
                         &err_str,
                     )
                     .await;
+                    let upstream_status = match &e {
+                        ProxyError::Upstream { status, .. } => Some(*status as i64),
+                        _ => None,
+                    };
+                    last_upstream_status = upstream_status;
                     match classify_failure(&e) {
                         FailureAction::ReturnToClient => {
-                            BillingManager::refund(billing_repo, session).await?;
-                            return Err(e);
+                            if let Err(refund_err) =
+                                BillingManager::refund(billing_repo, session).await
+                            {
+                                tracing::error!(
+                                    "refund after ReturnToClient failure failed: {}",
+                                    refund_err
+                                );
+                            }
+                            return Err(ExecutionFailure::from_last_attempt(
+                                rk,
+                                attempted,
+                                upstream_status,
+                                e,
+                            ));
                         }
                         FailureAction::Disable => {
                             self.health.mark_disabled(rk.key.id).await;
@@ -769,18 +1079,46 @@ impl Executor {
                             self.health.mark_cooldown(rk.key.id).await;
                             continue;
                         }
+                        FailureAction::SkipBinding => {
+                            // key 本身没问题（404/context_length_exceeded），跳到下一个 binding
+                            break;
+                        }
                     }
                 }
+            }
             }
         }
 
         // All keys failed during bootstrap. Refund + error.
-        BillingManager::refund(billing_repo, session).await?;
-        Err(ProxyError::AllKeysExhausted {
-            model: ctx.canonical_name.clone(),
-            attempted_keys: attempted,
-            last_error,
-        })
+        if let Err(refund_err) = BillingManager::refund(billing_repo, session).await {
+            tracing::error!("refund after all keys exhausted failed: {}", refund_err);
+        }
+        let last_rk = last_tried_rk;
+        let mut failure = match last_rk {
+            Some(rk) => ExecutionFailure::from_last_attempt(
+                rk,
+                attempted,
+                last_upstream_status,
+                ProxyError::AllKeysExhausted {
+                    model: ctx.canonical_name.clone(),
+                    attempted_keys: Vec::new(),
+                    last_error: last_error.clone(),
+                },
+            ),
+            None => ExecutionFailure::no_attempt(ProxyError::AllKeysExhausted {
+                model: ctx.canonical_name.clone(),
+                attempted_keys: Vec::new(),
+                last_error: last_error.clone(),
+            }),
+        };
+        if let ProxyError::AllKeysExhausted {
+            attempted_keys: ref mut ak,
+            ..
+        } = &mut failure.error
+        {
+            *ak = failure.attempted_keys.clone();
+        }
+        Err(failure)
     }
 }
 
@@ -950,10 +1288,38 @@ mod tests {
             classify_failure(&ProxyError::Upstream { status: 503, body: "".into() }),
             FailureAction::Cooldown
         );
-        // 404 is not in any of the three categories → cooldown (try next key)
+    }
+
+    #[test]
+    fn test_classify_skip_binding_for_404_and_context_length() {
+        // 404 → SkipBinding (model not found at upstream)
         assert_eq!(
             classify_failure(&ProxyError::Upstream { status: 404, body: "".into() }),
-            FailureAction::Cooldown
+            FailureAction::SkipBinding
+        );
+        // 400 + context_length_exceeded → SkipBinding
+        assert_eq!(
+            classify_failure(&ProxyError::Upstream {
+                status: 400,
+                body: r#"{"error":{"code":"context_length_exceeded"}}"#.into()
+            }),
+            FailureAction::SkipBinding
+        );
+        // 400 + 其他原因 → ReturnToClient（不被 SkipBinding 拦截）
+        assert_eq!(
+            classify_failure(&ProxyError::Upstream {
+                status: 400,
+                body: r#"{"error":"bad request"}"#.into()
+            }),
+            FailureAction::ReturnToClient
+        );
+        // 大小写不敏感
+        assert_eq!(
+            classify_failure(&ProxyError::Upstream {
+                status: 400,
+                body: "CONTEXT_LENGTH_EXCEEDED".into()
+            }),
+            FailureAction::SkipBinding
         );
     }
 
@@ -1248,22 +1614,21 @@ mod tests {
     // ---------- select_keys: route ordering ----------
 
     #[tokio::test]
-    async fn test_select_keys_orders_by_tier_then_priority() {
-        // Loader returns ch1 (Paid, priority 100) and ch2 (Free, priority 50).
-        // Expected order: ch2's key first (Free + lower priority number),
-        // then ch1's key.
+    async fn test_select_keys_orders_by_binding_priority() {
+        // Loader returns ch1 (Paid, binding_priority 100) and ch2 (Free, binding_priority 50).
+        // Expected order: ch2's binding first (lower binding_priority),
+        // then ch1's binding. Each binding has 1 key.
         let exec = make_executor();
         let loader = loader_with_two_keys();
         let ctx = ctx(7);
 
-        let keys = exec.select_keys(&ctx, &loader).await.unwrap();
-        assert_eq!(keys.len(), 2);
-        // Free key (id=11) first, Paid (id=10) second
-        assert_eq!(keys[0].key.id, 11);
-        assert_eq!(keys[1].key.id, 10);
-        // upstream names propagated
-        assert_eq!(keys[0].upstream_model_name, "up-b");
-        assert_eq!(keys[1].upstream_model_name, "up-a");
+        let groups = exec.select_keys(&ctx, &loader).await.unwrap();
+        assert_eq!(groups.len(), 2); // 2 bindings
+        // binding_priority 50 (ch2/up-b) 先于 100 (ch1/up-a)
+        assert_eq!(groups[0][0].key.id, 11);
+        assert_eq!(groups[0][0].upstream_model_name, "up-b");
+        assert_eq!(groups[1][0].key.id, 10);
+        assert_eq!(groups[1][0].upstream_model_name, "up-a");
     }
 
     #[tokio::test]
@@ -1274,11 +1639,10 @@ mod tests {
 
         // Mark key 11 (would be first) as cooldown.
         exec.health.mark_cooldown(11).await;
-        let keys = exec.select_keys(&ctx, &loader).await.unwrap();
-        // Only key 10 remains — key 11 was filtered out by the sync
-        // availability predicate inside Router::route.
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].key.id, 10);
+        let groups = exec.select_keys(&ctx, &loader).await.unwrap();
+        // key 11 不可用 → ch2/up-b binding 整个被丢弃（无可用 key），仅剩 ch1/up-a binding
+        assert_eq!(groups.len(), 1); // 1 binding
+        assert_eq!(groups[0][0].key.id, 10);
     }
 
     #[tokio::test]
@@ -1323,7 +1687,7 @@ mod tests {
         async fn log_usage(&self, _: i64, _: i64, _: i64, _: i64, _: i64, _: &Usage, _: i64, _: &str, _: &str, _: Option<&str>) -> ProxyResult<()> { Ok(()) }
         async fn add_key_usage(&self, _: i64, _: u64) -> ProxyResult<()> { Ok(()) }
         async fn add_small_model_usage(&self, _: i64, _: &str, _: i64, _: &str) -> ProxyResult<()> { Ok(()) }
-        async fn log_request(&self, _: &str, _: Option<&str>, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: Option<&str>, _: Option<&str>, _: Option<&str>, _: Option<i64>, _: i64, _: i64, _: bool, _: Option<&str>, _: Option<i64>, _: Option<i64>, _: i64) -> ProxyResult<()> { Ok(()) }
+        async fn log_request(&self, _: &str, _: Option<&str>, _: &str, _: &str, _: Option<&str>, _: Option<&str>, _: Option<&str>, _: Option<&str>, _: Option<&str>, _: Option<i64>, _: Option<&str>, _: i64, _: i64, _: bool, _: Option<&str>, _: Option<i64>, _: Option<i64>, _: i64) -> ProxyResult<()> { Ok(()) }
     }
 
     #[tokio::test]
@@ -1334,11 +1698,15 @@ mod tests {
         ctx.model_id = 999; // no bindings
         let body = serde_json::json!({"model": "x", "messages": []});
 
-        let err = exec
+        let fail = exec
             .execute(&ctx, EntryFormat::OpenAI, body, &NoopBilling, &NoopWriter, &loader)
             .await
             .unwrap_err();
-        assert!(matches!(err, ProxyError::AllKeysExhausted { .. }), "got {:?}", err);
+        assert!(matches!(fail.error, ProxyError::AllKeysExhausted { .. }), "got {:?}", fail.error);
+        // 无任何 key 被尝试 → 审计上下文应为 None
+        assert!(fail.channel_name.is_none());
+        assert!(fail.upstream_model_name.is_none());
+        assert!(fail.attempted_keys.is_empty());
     }
 
     #[tokio::test]
@@ -1356,15 +1724,19 @@ mod tests {
             "max_tokens": 10
         });
 
-        let err = exec
+        let fail = exec
             .execute(&ctx, EntryFormat::OpenAI, body, &NoopBilling, &NoopWriter, &loader)
             .await
             .unwrap_err();
 
-        match err {
+        match fail.error {
             ProxyError::AllKeysExhausted { attempted_keys, .. } => {
                 // both keys were attempted
                 assert_eq!(attempted_keys.len(), 2, "both keys should be tried");
+                // 审计上下文：最后一个候选（ch-1, up-a）的渠道信息
+                assert_eq!(fail.channel_name.as_deref(), Some("ch-1"));
+                assert_eq!(fail.upstream_model_name.as_deref(), Some("up-a"));
+                assert_eq!(fail.attempted_keys.len(), 2);
             }
             other => panic!("expected AllKeysExhausted, got {:?}", other),
         }
@@ -1390,10 +1762,12 @@ mod tests {
         ctx.model_id = 999;
         let body = serde_json::json!({"model": "x", "messages": []});
 
-        let err = exec
+        let fail = exec
             .execute_stream(&ctx, EntryFormat::OpenAI, body, &NoopBilling, &NoopWriter, &loader)
             .await
             .unwrap_err();
-        assert!(matches!(err, ProxyError::AllKeysExhausted { .. }));
+        assert!(matches!(fail.error, ProxyError::AllKeysExhausted { .. }));
+        assert!(fail.channel_name.is_none());
+        assert!(fail.upstream_model_name.is_none());
     }
 }

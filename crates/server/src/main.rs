@@ -75,6 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (×1,000,000) for integer-precision billing. Idempotent via
     // schema_meta marker table.
     chennix_storage::schema::migrate_v3_to_v4(&conn)?;
+    // Apply v4→v5 migration: convert all time fields from SQLite
+    // `datetime('now')` UTC text to RFC 3339 with explicit `+08:00`
+    // (Beijing time) offset. Fixes the dashboard "today" timezone bug.
+    // Idempotent via schema_meta marker table.
+    chennix_storage::schema::migrate_v4_to_v5(&conn)?;
 
     // 4. Ensure default admin
     config::ensure_default_admin(&conn)?;

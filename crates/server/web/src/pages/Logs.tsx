@@ -222,7 +222,7 @@ export default function Logs() {
                   <TableHead className="text-right">用户</TableHead>
                   <TableHead className="text-right">Token</TableHead>
                   <TableHead>渠道</TableHead>
-                  <TableHead>模型</TableHead>
+                  <TableHead className="min-w-[160px]">模型</TableHead>
                   <TableHead>状态码</TableHead>
                   <TableHead className="text-right">消耗</TableHead>
                   <TableHead className="text-right">耗时</TableHead>
@@ -230,33 +230,50 @@ export default function Logs() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {logs.map((log) => (
-                  <TableRow key={log.id}>
-                    <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
-                      {formatDate(log.created_at)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums text-xs">
-                      {log.user_id ?? "-"}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums text-xs">
-                      {log.token_id ?? "-"}
-                    </TableCell>
-                    <TableCell className="text-xs">{log.channel_name ?? "-"}</TableCell>
-                    <TableCell className="text-xs">
-                      {log.normalized_model || log.client_model || "-"}
-                    </TableCell>
-                    <TableCell>{statusBadge(log.response_status)}</TableCell>
-                    <TableCell className="text-right tabular-nums text-xs">
-                      {formatCost(log.quota_cost)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums text-xs">
-                      {formatNumber(log.duration_ms)} ms
-                    </TableCell>
-                    <TableCell className="max-w-[300px] truncate text-xs text-muted-foreground" title={log.error_message ?? ""}>
-                      {log.error_message ?? "-"}
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {logs.map((log) => {
+                  // 客户端请求的模型名（归一化后的大模型）
+                  const clientModel = log.normalized_model || log.client_model
+                  // 实际命中的上游模型（绑定时配置的 upstream_model_name）
+                  const upstreamModel = log.upstream_model
+                  // 客户端模型与上游模型相同（或无上游模型）时只显示一行
+                  const sameModel = !upstreamModel || upstreamModel === clientModel
+                  return (
+                    <TableRow key={log.id}>
+                      <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                        {formatDate(log.created_at)}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums text-xs">
+                        {log.user_id ?? "-"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums text-xs">
+                        {log.token_id ?? "-"}
+                      </TableCell>
+                      <TableCell className="text-xs">{log.channel_name ?? "-"}</TableCell>
+                      <TableCell className="text-xs">
+                        {sameModel ? (
+                          <span>{clientModel ?? "-"}</span>
+                        ) : (
+                          <div className="flex flex-col gap-0.5">
+                            <span>{clientModel ?? "-"}</span>
+                            <span className="text-[10px] text-muted-foreground" title="实际调用的上游模型">
+                              → {upstreamModel}
+                            </span>
+                          </div>
+                        )}
+                      </TableCell>
+                      <TableCell>{statusBadge(log.response_status)}</TableCell>
+                      <TableCell className="text-right tabular-nums text-xs">
+                        {formatCost(log.quota_cost)}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums text-xs">
+                        {formatNumber(log.duration_ms)} ms
+                      </TableCell>
+                      <TableCell className="max-w-[300px] truncate text-xs text-muted-foreground" title={log.error_message ?? ""}>
+                        {log.error_message ?? "-"}
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
               </TableBody>
             </Table>
           )}

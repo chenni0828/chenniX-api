@@ -1,6 +1,8 @@
 use chennix_common::{DashboardOverview, ModelUsage, ProxyError, ProxyResult, RequestLog, TokenUsageStats, Usage, UsageSummary};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::now_iso8601;
+
 pub struct UsageRepo<'a> {
     conn: &'a Connection,
 }
@@ -28,8 +30,8 @@ impl<'a> UsageRepo<'a> {
                 "INSERT INTO usage_logs
                  (channel_id, key_id, model_id, user_id, token_id, quota_cost,
                   prompt_tokens, completion_tokens, total_tokens,
-                  request_type, status, error_message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  request_type, status, error_message, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     channel_id,
                     key_id,
@@ -43,6 +45,7 @@ impl<'a> UsageRepo<'a> {
                     request_type,
                     status,
                     error_message,
+                    now_iso8601(),
                 ],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -61,6 +64,7 @@ impl<'a> UsageRepo<'a> {
         key_label: Option<&str>,
         attempted_keys: Option<&str>,
         upstream_status: Option<i64>,
+        upstream_model: Option<&str>,
         response_status: i64,
         duration_ms: i64,
         stream: bool,
@@ -73,9 +77,10 @@ impl<'a> UsageRepo<'a> {
             .execute(
                 "INSERT INTO request_logs
                  (request_id, client_ip, method, path, client_model, normalized_model,
-                  channel_name, key_label, attempted_keys, upstream_status, response_status,
-                  duration_ms, stream, user_id, token_id, quota_cost, error_message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                  channel_name, key_label, attempted_keys, upstream_status, upstream_model,
+                  response_status, duration_ms, stream, user_id, token_id, quota_cost,
+                  error_message, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     request_id,
                     client_ip,
@@ -87,6 +92,7 @@ impl<'a> UsageRepo<'a> {
                     key_label,
                     attempted_keys,
                     upstream_status,
+                    upstream_model,
                     response_status,
                     duration_ms,
                     if stream { 1 } else { 0 },
@@ -94,6 +100,7 @@ impl<'a> UsageRepo<'a> {
                     token_id,
                     quota_cost,
                     error_message,
+                    now_iso8601(),
                 ],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -102,15 +109,24 @@ impl<'a> UsageRepo<'a> {
 
     /// Daily aggregate usage series across all users (admin view).
     /// Returns `(day_string, total_tokens, total_quota_cost)` per day.
+    ///
+    /// 时区说明：`created_at` 存储为 RFC 3339 带时区文本（+08:00 北京时间）。
+    /// SQLite 的 `DATE()` / `datetime()` 函数会先把带时区输入归一化为 UTC，
+    /// 再应用修饰符。因此 `DATE(created_at, '+8 hours')` 将其转回北京日期，
+    /// 与 `DATE('now', '+8 hours')`（当前北京日期）对齐。
+    /// WHERE 子句用 `datetime(created_at) >= datetime('now', ?1)` 两边都
+    /// 归一化为 UTC `'YYYY-MM-DD HH:MM:SS'`，避免 RFC 3339 字符串与
+    /// `datetime()` 返回值直接做字典序比较时因 `T` vs 空格 / `+08:00`
+    /// 后缀导致的边界错误。
     pub fn get_all_usage(&self, days: u32) -> ProxyResult<Vec<(String, u64, i64)>> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT DATE(created_at) as day,
+                "SELECT DATE(created_at, '+8 hours') as day,
                         SUM(total_tokens) as tokens,
                         SUM(quota_cost) as quota
                  FROM usage_logs
-                 WHERE created_at >= datetime('now', ?1)
+                 WHERE datetime(created_at) >= datetime('now', ?1)
                  GROUP BY day ORDER BY day",
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -139,11 +155,11 @@ impl<'a> UsageRepo<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT DATE(created_at) as day,
+                "SELECT DATE(created_at, '+8 hours') as day,
                         SUM(total_tokens) as tokens,
                         SUM(quota_cost) as quota
                  FROM usage_logs
-                 WHERE user_id = ?1 AND created_at >= datetime('now', ?2)
+                 WHERE user_id = ?1 AND datetime(created_at) >= datetime('now', ?2)
                  GROUP BY day ORDER BY day",
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -185,8 +201,8 @@ impl<'a> UsageRepo<'a> {
             .conn
             .prepare(
                 "SELECT id, request_id, method, path, client_model, normalized_model,
-                        channel_name, response_status, duration_ms, stream, quota_cost,
-                        created_at, error_message
+                        channel_name, upstream_model, response_status, duration_ms,
+                        stream, quota_cost, created_at, error_message
                  FROM request_logs
                  WHERE user_id = ?1
                  ORDER BY id DESC
@@ -208,17 +224,21 @@ impl<'a> UsageRepo<'a> {
     /// Dashboard overview: today's tokens, requests, errors, and available keys.
     ///
     /// Runs four sub-queries in a single SQL statement for efficiency.
+    /// "今日"按北京时间界定：`DATE(x, '+8 hours')` 把带时区（+08:00）的
+    /// `created_at` 归一化为 UTC 后再加 8 小时，得到北京日期；与
+    /// `DATE('now', '+8 hours')`（当前北京日期）比较。
     pub fn get_dashboard_overview(&self) -> ProxyResult<DashboardOverview> {
         let row = self
             .conn
             .query_row(
                 "SELECT
                    (SELECT COALESCE(SUM(total_tokens), 0) FROM usage_logs
-                    WHERE DATE(created_at) = DATE('now')),
+                    WHERE DATE(created_at, '+8 hours') = DATE('now', '+8 hours')),
                    (SELECT COUNT(*) FROM request_logs
-                    WHERE DATE(created_at) = DATE('now')),
+                    WHERE DATE(created_at, '+8 hours') = DATE('now', '+8 hours')),
                    (SELECT COUNT(*) FROM request_logs
-                    WHERE DATE(created_at) = DATE('now') AND response_status >= 400),
+                    WHERE DATE(created_at, '+8 hours') = DATE('now', '+8 hours')
+                      AND response_status >= 400),
                    (SELECT COUNT(*) FROM channel_keys WHERE status = 'active')",
                 [],
                 |r| {
@@ -247,7 +267,7 @@ impl<'a> UsageRepo<'a> {
                         COALESCE(SUM(u.quota_cost), 0)
                  FROM usage_logs u
                  JOIN models m ON u.model_id = m.id
-                 WHERE DATE(u.created_at) = DATE('now')
+                 WHERE DATE(u.created_at, '+8 hours') = DATE('now', '+8 hours')
                  GROUP BY m.canonical_name
                  ORDER BY SUM(u.total_tokens) DESC
                  LIMIT ?1",
@@ -326,12 +346,20 @@ impl<'a> UsageRepo<'a> {
             param_idx += 1;
         }
         if start > 0 {
-            sql.push_str(&format!(" AND u.created_at >= datetime(?{}, 'unixepoch')", param_idx));
+            // 用 datetime() 包裹 created_at，让带时区 RFC 3339 与 UTC 文本
+            // 在统一的 'YYYY-MM-DD HH:MM:SS' 格式上做字典序比较。
+            sql.push_str(&format!(
+                " AND datetime(u.created_at) >= datetime(?{}, 'unixepoch')",
+                param_idx
+            ));
             params_vec.push(Box::new(start));
             param_idx += 1;
         }
         if end > 0 {
-            sql.push_str(&format!(" AND u.created_at <= datetime(?{}, 'unixepoch')", param_idx));
+            sql.push_str(&format!(
+                " AND datetime(u.created_at) <= datetime(?{}, 'unixepoch')",
+                param_idx
+            ));
             params_vec.push(Box::new(end));
             param_idx += 1;
         }
@@ -398,12 +426,20 @@ impl<'a> UsageRepo<'a> {
             idx += 1;
         }
         if start > 0 {
-            where_clause.push_str(&format!(" AND created_at >= datetime(?{}, 'unixepoch')", idx));
+            // 用 datetime() 包裹 created_at，让带时区 RFC 3339 与 UTC 文本
+            // 在统一的 'YYYY-MM-DD HH:MM:SS' 格式上做字典序比较。
+            where_clause.push_str(&format!(
+                " AND datetime(created_at) >= datetime(?{}, 'unixepoch')",
+                idx
+            ));
             params_vec.push(Box::new(start));
             idx += 1;
         }
         if end > 0 {
-            where_clause.push_str(&format!(" AND created_at <= datetime(?{}, 'unixepoch')", idx));
+            where_clause.push_str(&format!(
+                " AND datetime(created_at) <= datetime(?{}, 'unixepoch')",
+                idx
+            ));
             params_vec.push(Box::new(end));
             idx += 1;
         }
@@ -435,8 +471,8 @@ impl<'a> UsageRepo<'a> {
         let query_sql = format!(
             "SELECT id, request_id, client_ip, method, path, client_model,
                     normalized_model, channel_name, key_label, upstream_status,
-                    response_status, duration_ms, stream, user_id, token_id,
-                    quota_cost, error_message, created_at
+                    upstream_model, response_status, duration_ms, stream,
+                    user_id, token_id, quota_cost, error_message, created_at
              FROM request_logs
              {}
              ORDER BY id DESC
@@ -496,7 +532,7 @@ impl<'a> UsageRepo<'a> {
 
 /// Map a `request_logs` row to the `RequestLog` type from `chennix_common`.
 fn map_admin_request_log(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLog> {
-    let stream: i64 = r.get(12)?;
+    let stream: i64 = r.get(13)?;
     Ok(RequestLog {
         id: r.get(0)?,
         request_id: r.get(1)?,
@@ -508,14 +544,15 @@ fn map_admin_request_log(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLog> 
         channel_name: r.get(7)?,
         key_label: r.get(8)?,
         upstream_status: r.get::<_, Option<i64>>(9)?.map(|v| v as i32),
-        response_status: r.get::<_, i64>(10)? as i32,
-        duration_ms: r.get(11)?,
+        upstream_model: r.get(10)?,
+        response_status: r.get::<_, i64>(11)? as i32,
+        duration_ms: r.get(12)?,
         stream: stream != 0,
-        user_id: r.get(13)?,
-        token_id: r.get(14)?,
-        quota_cost: r.get(15)?,
-        error_message: r.get(16)?,
-        created_at: r.get(17)?,
+        user_id: r.get(14)?,
+        token_id: r.get(15)?,
+        quota_cost: r.get(16)?,
+        error_message: r.get(17)?,
+        created_at: r.get(18)?,
     })
 }
 
@@ -528,6 +565,7 @@ pub struct RequestLogRow {
     pub client_model: Option<String>,
     pub normalized_model: Option<String>,
     pub channel_name: Option<String>,
+    pub upstream_model: Option<String>,
     pub response_status: i64,
     pub duration_ms: i64,
     pub stream: bool,
@@ -537,7 +575,7 @@ pub struct RequestLogRow {
 }
 
 fn map_request_log_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogRow> {
-    let stream: i64 = r.get(9)?;
+    let stream: i64 = r.get(10)?;
     Ok(RequestLogRow {
         id: r.get(0)?,
         request_id: r.get(1)?,
@@ -546,12 +584,13 @@ fn map_request_log_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogRow>
         client_model: r.get(4)?,
         normalized_model: r.get(5)?,
         channel_name: r.get(6)?,
-        response_status: r.get(7)?,
-        duration_ms: r.get(8)?,
+        upstream_model: r.get(7)?,
+        response_status: r.get(8)?,
+        duration_ms: r.get(9)?,
         stream: stream != 0,
-        quota_cost: r.get(10)?,
-        created_at: r.get(11)?,
-        error_message: r.get(12)?,
+        quota_cost: r.get(11)?,
+        created_at: r.get(12)?,
+        error_message: r.get(13)?,
     })
 }
 
@@ -660,7 +699,7 @@ mod tests {
             .log_request(
                 "req-123", Some("127.0.0.1"), "POST", "/v1/chat/completions",
                 Some("deepseek-v3"), Some("deepseek-v3"), Some("test"), Some("sk"),
-                Some(r#"["sk"]"#), Some(200), 200, 150, false, None,
+                Some(r#"["sk"]"#), Some(200), Some("deepseek-chat"), 200, 150, false, None,
                 Some(1), Some(1), 25,
             )
             .unwrap();
@@ -679,6 +718,7 @@ mod tests {
         assert_eq!(row.quota_cost, 25);
         assert_eq!(row.client_model.as_deref(), Some("deepseek-v3"));
         assert_eq!(row.channel_name.as_deref(), Some("test"));
+        assert_eq!(row.upstream_model.as_deref(), Some("deepseek-chat"));
         assert!(row.error_message.is_none());
     }
 
@@ -693,7 +733,7 @@ mod tests {
         for i in 0..5 {
             repo.log_request(
                 &format!("alice-{}", i), None, "POST", "/v1/chat", None, None,
-                None, None, None, Some(200), 200, 10 * i, false, None,
+                None, None, None, Some(200), None, 200, 10 * i, false, None,
                 Some(1), Some(1), i,
             )
             .unwrap();
@@ -701,7 +741,7 @@ mod tests {
         for i in 0..2 {
             repo.log_request(
                 &format!("bob-{}", i), None, "POST", "/v1/chat", None, None,
-                None, None, None, Some(200), 200, 10, false, None,
+                None, None, None, Some(200), None, 200, 10, false, None,
                 Some(2), Some(1), i,
             )
             .unwrap();
@@ -753,7 +793,7 @@ mod tests {
         // anonymous request (no user / token)
         repo.log_request(
             "req-anon", Some("127.0.0.1"), "GET", "/health", None, None,
-            None, None, None, None, 200, 5, false, None,
+            None, None, None, None, None, 200, 5, false, None,
             None, None, 0,
         )
         .unwrap();

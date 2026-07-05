@@ -34,12 +34,12 @@ export interface CreateKeyData {
   api_key: string
   label?: string | null
   is_free: boolean
-  priority: number
   quota_limit: number
   price_per_1k_tokens: number
 }
 
 export interface UpdateKeyData extends CreateKeyData {
+  priority: number
   status: string
 }
 
@@ -72,6 +72,8 @@ export const channelApi = {
   deleteKey: (channelId: number, keyId: number) => api.delete(`/channels/${channelId}/keys/${keyId}`).then((r) => r.data),
   resetKeyQuota: (channelId: number, keyId: number) =>
     api.post(`/channels/${channelId}/keys/${keyId}/reset-quota`).then((r) => r.data),
+  reorderKeys: (channelId: number, keyIds: number[]) =>
+    api.put(`/channels/${channelId}/keys/reorder`, { key_ids: keyIds }).then((r) => r.data),
   reload: () => api.post("/reload").then((r) => r.data),
   testChannel: (channelId: number) => api.post<ChannelTestResult>(`/channels/${channelId}/test`).then((r) => r.data),
   getModels: (channelId: number) => api.get<ChannelModel[]>(`/channels/${channelId}/models`).then((r) => r.data),

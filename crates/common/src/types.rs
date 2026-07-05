@@ -336,6 +336,10 @@ pub struct RequestLog {
     pub channel_name: Option<String>,
     pub key_label: Option<String>,
     pub upstream_status: Option<i32>,
+    /// 实际调用的上游模型名（绑定时配置的 upstream_model_name）。
+    /// 与归一化后的 `normalized_model` 区分开，便于审计定位「具体调
+    /// 用了哪个上游模型」。
+    pub upstream_model: Option<String>,
     pub response_status: i32,
     pub duration_ms: i64,
     pub stream: bool,
@@ -343,7 +347,9 @@ pub struct RequestLog {
     pub token_id: Option<i64>,
     pub quota_cost: i64,
     pub error_message: Option<String>,
-    /// SQLite datetime string, e.g. `"2026-07-01 12:34:56"`.
+    /// RFC 3339 timestamp with `+08:00` offset, e.g. `"2026-07-01T12:34:56+08:00"`.
+    /// Prior to migrate_v4_to_v5, this was a SQLite `datetime('now')` UTC text
+    /// like `"2026-07-01 04:34:56"`; old rows are converted on migration.
     pub created_at: String,
 }
 

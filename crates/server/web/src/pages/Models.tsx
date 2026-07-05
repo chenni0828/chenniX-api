@@ -56,6 +56,13 @@ const hasDragType = (e: React.DragEvent, mime: string): boolean => {
 const weightKey = (modelId: number, channelId: number, upstream: string) =>
   `${modelId}:${channelId}:${upstream}`
 
+// 启发式规则：判断一个 model 是否为「提升的独立对外小模型」。
+// 满足条件：仅有 1 个绑定，且对外名与上游模型名相同（即用上游原名对外）。
+// 这类 model 在「独立对外小模型」区域以紧凑卡片展示，不占用大模型网格空间。
+// 一旦用户加第二个绑定或重命名，就自动归入大模型网格。
+const isPromotedSmallModel = (m: ModelInfo): boolean =>
+  m.bindings.length === 1 && m.canonical_name === m.bindings[0].upstream_model_name
+
 export default function Models() {
   const [models, setModels] = useState<ModelInfo[]>([])
   const [smallModels, setSmallModels] = useState<SmallModel[]>([])
@@ -98,6 +105,10 @@ export default function Models() {
 
   // Pool → card drop highlight (which large-model card is currently a drop target)
   const [dropTargetModelId, setDropTargetModelId] = useState<number | null>(null)
+
+  // Pool → promote-zone drop highlight (independent small model area)
+  const [dropTargetPromote, setDropTargetPromote] = useState(false)
+  const [promoting, setPromoting] = useState(false)
 
   // LB weight input drafts, keyed by `${modelId}:${channelId}:${upstream}`
   const [weightDrafts, setWeightDrafts] = useState<Record<string, string>>({})
@@ -330,6 +341,76 @@ export default function Models() {
 
   const handlePoolDragEnd = () => {
     setDropTargetModelId(null)
+    setDropTargetPromote(false)
+  }
+
+  // ===== Pool → promote zone drop (create independent small model) =====
+  // 将小模型池项目提升为独立对外模型：
+  //   1) 前端重名检查：models 中已存在同名（无论大模型还是已提升的小模型）则拒绝
+  //   2) 调用 modelApi.create 创建 models 行
+  //   3) 调用 modelApi.addBinding 绑定到来源渠道（用上游原名）
+  // 任意一步失败都给出明确提示；create 成功但 addBinding 失败会留下"裸 model"，
+  // 由 refreshAll 拉回最新状态后用户可手动删除或重新绑定。
+  const handlePromoteDragOver = (e: React.DragEvent) => {
+    if (!hasDragType(e, POOL_DRAG_MIME)) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = "copy"
+    if (!dropTargetPromote) setDropTargetPromote(true)
+  }
+
+  const handlePromoteDrop = async (e: React.DragEvent) => {
+    const payload = e.dataTransfer.getData(POOL_DRAG_MIME)
+    if (!payload) return
+    e.preventDefault()
+    e.stopPropagation()
+    setDropTargetPromote(false)
+    let parsed: { channel_id: number; raw_model_name: string }
+    try {
+      parsed = JSON.parse(payload)
+    } catch {
+      return
+    }
+    // 重名检查：models 表中已有同名 canonical_name 则拒绝（含大模型与已提升的小模型）
+    const dupName = models.some(m => m.canonical_name === parsed.raw_model_name)
+    if (dupName) {
+      toast({
+        title: `已存在同名模型「${parsed.raw_model_name}」，无法提升`,
+        description: "请先重命名已有模型，或选择其他小模型",
+        variant: "destructive",
+      })
+      return
+    }
+    setPromoting(true)
+    try {
+      // 步骤 1：创建 models 行（canonical_name = 上游原名）
+      // 后端返回 ModelDetail { id, canonical_name, routing_strategy }，提取 id 用于绑定
+      const newModel = await modelApi.create({ canonical_name: parsed.raw_model_name })
+      // 步骤 2：绑定到来源渠道
+      try {
+        await modelApi.addBinding(newModel.id, parsed.channel_id, parsed.raw_model_name)
+        toast({ title: `已提升「${parsed.raw_model_name}」为独立对外模型` })
+      } catch (err: unknown) {
+        // 绑定失败：模型已创建但无绑定，给出明确提示，refreshAll 会拉回空绑定模型
+        const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || "绑定失败"
+        toast({
+          title: "模型已创建但绑定失败",
+          description: `${msg}，请手动绑定或删除该模型`,
+          variant: "destructive",
+        })
+      }
+      refreshAll()
+    } catch (err: unknown) {
+      const resp = (err as { response?: { status?: number; data?: { message?: string } } })?.response
+      const msg = resp?.data?.message || ""
+      const status = resp?.status
+      if (status === 409 || /already|conflict|duplicate|exists|已存在|已绑定/i.test(msg)) {
+        toast({ title: `已存在同名模型「${parsed.raw_model_name}」`, variant: "destructive" })
+      } else {
+        toast({ title: msg || "提升失败", variant: "destructive" })
+      }
+    } finally {
+      setPromoting(false)
+    }
   }
 
   const handleCardDragOver = (e: React.DragEvent, m: ModelInfo) => {
@@ -500,6 +581,10 @@ export default function Models() {
     return null
   }
 
+  // 派生：提升的独立小模型 vs 大模型网格
+  const promotedModels = models.filter(isPromotedSmallModel)
+  const largeModels = models.filter(m => !isPromotedSmallModel(m))
+
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center py-20">
@@ -588,8 +673,115 @@ export default function Models() {
         </CardContent>
       </Card>
 
+      {/* Independent small models (promoted from pool, exposed under upstream raw name) */}
+      <Card
+        onDragOver={handlePromoteDragOver}
+        onDragLeave={() => setDropTargetPromote(false)}
+        onDrop={handlePromoteDrop}
+        className={dropTargetPromote ? "border-primary ring-2 ring-primary/20" : ""}
+      >
+        <CardContent className="p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Zap className="h-4 w-4 text-muted-foreground" />
+              <h2 className="text-sm font-semibold">独立对外小模型</h2>
+              <Badge variant="outline" className="shrink-0">{promotedModels.length} 个</Badge>
+            </div>
+            <p className="text-xs text-muted-foreground hidden sm:block">
+              拖拽小模型池项目到此区域，用上游原名单独对外（不参与大模型路由）
+            </p>
+          </div>
+          {promotedModels.length === 0 ? (
+            <div
+              className={`flex items-center gap-2 rounded-md border border-dashed px-3 py-4 text-sm transition-colors ${
+                dropTargetPromote ? "border-primary bg-primary/5 text-primary" : "text-muted-foreground"
+              }`}
+            >
+              <Zap className="h-4 w-4 shrink-0" />
+              <span>
+                {promoting ? "正在提升..." : "拖拽小模型池项目到此区域以提升为独立对外模型"}
+              </span>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {promotedModels.map((m) => {
+                const b = m.bindings[0]
+                const testKey = `${m.id}:${b.channel_id}:${b.upstream_model_name}`
+                const testState = testStates[testKey]
+                const summary = pricingSummary(m.id, b.channel_id, b.upstream_model_name)
+                return (
+                  <div
+                    key={`${m.id}:${b.channel_id}:${b.upstream_model_name}`}
+                    className="group flex items-center gap-2 rounded-md border bg-card px-2.5 py-2 transition-colors hover:border-primary/50 hover:bg-accent"
+                    title={`对外名：${m.canonical_name} · 渠道：${b.channel_name || `#${b.channel_id}`}`}
+                  >
+                    <Zap className="h-3.5 w-3.5 text-muted-foreground shrink-0 group-hover:text-primary" />
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-mono text-xs font-medium truncate max-w-[180px]">{m.canonical_name}</span>
+                        <Badge variant="secondary" className="shrink-0 text-[10px] px-1.5 py-0 leading-none">
+                          {b.channel_name || `渠道 #${b.channel_id}`}
+                        </Badge>
+                      </div>
+                      {summary && (
+                        <span className="text-[10px] text-muted-foreground truncate block max-w-[200px]">{summary}</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => handleTestBinding(m, b)}
+                        disabled={testState?.loading}
+                        title="测试连通性"
+                        className="h-7 w-7"
+                      >
+                        {testState?.loading ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Zap className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => openPricing(m, b)}
+                        title="编辑定价"
+                        className="h-7 w-7"
+                      >
+                        <DollarSign className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => setDeleteTarget(m)}
+                        title="删除独立模型"
+                        className="h-7 w-7"
+                      >
+                        <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
+              {promoting && (
+                <div className="flex items-center gap-2 rounded-md border border-dashed border-primary/50 px-2.5 py-2 text-xs text-primary">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>正在提升...</span>
+                </div>
+              )}
+            </div>
+          )}
+          {dropTargetPromote && promotedModels.length > 0 && (
+            <div className="mt-2 flex items-center justify-center gap-2 rounded-md border border-dashed border-primary px-3 py-2 text-xs text-primary">
+              <span>松开以提升为独立对外模型</span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Large model cards */}
-      {models.length === 0 ? (
+      {largeModels.length === 0 ? (
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-16">
             <Boxes className="h-12 w-12 text-muted-foreground mb-4" />
@@ -598,7 +790,7 @@ export default function Models() {
         </Card>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4">
-          {models.map((m) => {
+          {largeModels.map((m) => {
             const isDropTarget = dropTargetModelId === m.id
             const isAdding = addingBinding === m.id
             const isSwitching = switchingStrategy === m.id

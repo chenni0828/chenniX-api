@@ -11,6 +11,8 @@ export interface RequestLog {
   channel_name: string | null
   key_label: string | null
   upstream_status: number | null
+  /** 实际调用的上游模型名（绑定时配置的 upstream_model_name）。 */
+  upstream_model: string | null
   response_status: number
   duration_ms: number
   stream: boolean

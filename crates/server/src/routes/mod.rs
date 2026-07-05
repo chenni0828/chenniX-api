@@ -22,7 +22,7 @@ use bytes::Bytes;
 use chennix_adaptor::{Adaptor, ClaudeAdaptor, OpenaiAdaptor};
 use chennix_common::{AuthContext, ChannelProvider, ProxyError, Usage};
 use chennix_core::billing::BillingManager;
-use chennix_core::executor::{actual_cost, EntryFormat, ExecutionContext, StreamBootstrap};
+use chennix_core::executor::{actual_cost, EntryFormat, ExecutionContext, ExecutionFailure, StreamBootstrap};
 use chennix_core::tracker::{Tracker, UsageWriter};
 use chennix_translator::stream_state::{ClaudeToOpenaiStreamState, OpenaiToClaudeStreamState};
 use futures_util::StreamExt;
@@ -166,6 +166,7 @@ pub async fn proxy_request(
             None,
             None,
             None,
+            None,
             err.http_status() as i64,
             start.elapsed().as_millis() as i64,
             false,
@@ -218,11 +219,18 @@ pub async fn proxy_request(
                 user_id,
                 token_id,
             )),
-            Err(e) => {
+            Err(fail) => {
                 // execute_stream failed (bootstrap phase) — per-key failures
                 // are already tracked inside the executor. Record the
-                // request-level audit row here.
-                let err_str = e.to_string();
+                // request-level audit row here, with the audit context the
+                // executor carried back (channel/key/upstream_model/...).
+                let attempted_keys_csv = if fail.attempted_keys.is_empty() {
+                    None
+                } else {
+                    Some(fail.attempted_keys.join(","))
+                };
+                let err_str = format_failure_message(&fail);
+                let http_status = fail.error.http_status() as i64;
                 log_request_entry(
                     &state,
                     &request_id,
@@ -231,11 +239,12 @@ pub async fn proxy_request(
                     path,
                     client_model.as_deref(),
                     Some(&canonical_name),
-                    None,
-                    None,
-                    None,
-                    None,
-                    e.http_status() as i64,
+                    fail.channel_name.as_deref(),
+                    fail.key_label.as_deref(),
+                    attempted_keys_csv.as_deref(),
+                    fail.upstream_status,
+                    fail.upstream_model_name.as_deref(),
+                    http_status,
                     start.elapsed().as_millis() as i64,
                     true,
                     Some(&err_str),
@@ -244,7 +253,7 @@ pub async fn proxy_request(
                     0,
                 )
                 .await;
-                Err(e)
+                Err(fail.error)
             }
         }
     } else {
@@ -281,6 +290,7 @@ pub async fn proxy_request(
                     result.key_label.as_deref(),
                     attempted_keys_csv.as_deref(),
                     result.upstream_status,
+                    Some(&result.upstream_model_name),
                     200,
                     start.elapsed().as_millis() as i64,
                     false,
@@ -296,10 +306,19 @@ pub async fn proxy_request(
                     .body(Body::from(result.body))
                     .unwrap())
             }
-            Err(e) => {
+            Err(fail) => {
                 // execute failed — per-key failures are already tracked
-                // inside the executor. Record the request-level audit row.
-                let err_str = e.to_string();
+                // inside the executor. Record the request-level audit row,
+                // carrying channel/key/upstream_model/attempted_keys from
+                // the executor so the log row is no longer missing these
+                // fields (previously 400 errors showed empty channel/model).
+                let attempted_keys_csv = if fail.attempted_keys.is_empty() {
+                    None
+                } else {
+                    Some(fail.attempted_keys.join(","))
+                };
+                let err_str = format_failure_message(&fail);
+                let http_status = fail.error.http_status() as i64;
                 log_request_entry(
                     &state,
                     &request_id,
@@ -308,11 +327,12 @@ pub async fn proxy_request(
                     path,
                     client_model.as_deref(),
                     Some(&canonical_name),
-                    None,
-                    None,
-                    None,
-                    None,
-                    e.http_status() as i64,
+                    fail.channel_name.as_deref(),
+                    fail.key_label.as_deref(),
+                    attempted_keys_csv.as_deref(),
+                    fail.upstream_status,
+                    fail.upstream_model_name.as_deref(),
+                    http_status,
                     start.elapsed().as_millis() as i64,
                     false,
                     Some(&err_str),
@@ -321,14 +341,28 @@ pub async fn proxy_request(
                     0,
                 )
                 .await;
-                Err(e)
+                Err(fail.error)
             }
         }
     }
 }
 
+/// 构造失败审计日志的友好错误信息：在原始错误前加上渠道/上游模型上下文，
+/// 便于用户从日志直接定位「是哪个渠道、哪个上游模型报的错」。
+///
+/// 例：`[channel=deepseek, model=deepseek-chat] upstream error: status 400, body: {...}`
+fn format_failure_message(fail: &ExecutionFailure) -> String {
+    match (&fail.channel_name, &fail.upstream_model_name) {
+        (Some(ch), Some(m)) => format!("[channel={}, model={}] {}", ch, m, fail.error),
+        (Some(ch), None) => format!("[channel={}] {}", ch, fail.error),
+        (None, Some(m)) => format!("[model={}] {}", m, fail.error),
+        (None, None) => fail.error.to_string(),
+    }
+}
+
 /// Best-effort request_logs insertion. Errors are logged but never
 /// propagated — request logging must not affect the response path.
+#[allow(clippy::too_many_arguments)]
 async fn log_request_entry(
     state: &AppState,
     request_id: &str,
@@ -341,6 +375,7 @@ async fn log_request_entry(
     key_label: Option<&str>,
     attempted_keys: Option<&str>,
     upstream_status: Option<i64>,
+    upstream_model: Option<&str>,
     response_status: i64,
     duration_ms: i64,
     stream: bool,
@@ -362,6 +397,7 @@ async fn log_request_entry(
             key_label,
             attempted_keys,
             upstream_status,
+            upstream_model,
             response_status,
             duration_ms,
             stream,
@@ -595,6 +631,7 @@ fn stream_sse_response(
                 key_label.as_deref(),
                 attempted_keys.as_deref(),
                 None,
+                Some(upstream_model_name.as_str()),
                 200,
                 start.elapsed().as_millis() as i64,
                 true,

@@ -124,6 +124,7 @@ pub fn init_db(conn: &Connection) -> ProxyResult<()> {
             key_label TEXT,
             attempted_keys TEXT,
             upstream_status INTEGER,
+            upstream_model TEXT,
             response_status INTEGER,
             duration_ms INTEGER NOT NULL,
             stream INTEGER NOT NULL DEFAULT 0,
@@ -168,6 +169,9 @@ pub fn init_db(conn: &Connection) -> ProxyResult<()> {
         // Per-binding call priority (lower = tried first). Replaces the
         // channel-level `channels.priority` for routing order.
         "ALTER TABLE model_channels ADD COLUMN priority INTEGER NOT NULL DEFAULT 100",
+        // request_logs: 记录实际调用的上游模型名（与归一化后的 client_model
+        // 区分开），用于审计日志展示「具体调用了哪个上游模型」。
+        "ALTER TABLE request_logs ADD COLUMN upstream_model TEXT",
     ];
     for sql in &alter_statements {
         let _ = conn.execute_batch(sql); // ignore "duplicate column" errors
@@ -252,10 +256,12 @@ pub fn migrate_v1_to_v2(conn: &Connection) -> ProxyResult<()> {
             )
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
         if admin_count == 0 {
+            let now = crate::now_iso8601();
             conn.execute(
-                "INSERT INTO users (username, password_hash, role, status, \"group\")
-                 VALUES ('admin', 'PLACEHOLDER_BCRYPT_HASH', 10, 1, 'default')",
-                [],
+                "INSERT INTO users (username, password_hash, role, status, \"group\",
+                                    created_at, updated_at)
+                 VALUES ('admin', 'PLACEHOLDER_BCRYPT_HASH', 10, 1, 'default', ?1, ?1)",
+                [&now],
             )
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
         }
@@ -413,6 +419,109 @@ pub fn migrate_v3_to_v4(conn: &Connection) -> ProxyResult<()> {
     .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
 
     tracing::info!("migrate_v3_to_v4: converted money-quota fields to micro-yuan (×1,000,000)");
+    Ok(())
+}
+
+/// Migrate v4 → v5: convert all `created_at` / `updated_at` / time fields
+/// from SQLite `datetime('now')` UTC text (format `2026-07-04 17:51:00`,
+/// no timezone suffix, semantically UTC) to RFC 3339 with explicit
+/// `+08:00` offset (format `2026-07-05T01:51:00+08:00`, semantically
+/// Beijing time).
+///
+/// This fixes the dashboard "today" timezone bug where `DATE('now')`
+/// returned the UTC date, causing Beijing-time 00:00–08:00 requests to
+/// be counted as "yesterday".
+///
+/// Affected tables/fields:
+/// - `models.created_at`
+/// - `users.created_at`, `users.updated_at`
+/// - `tokens.created_at`, `tokens.updated_at`
+/// - `channels.created_at`, `channels.updated_at`
+/// - `channel_keys.created_at`, `channel_keys.updated_at`
+/// - `discovered_models.discovered_at`, `discovered_models.last_reset_at`
+/// - `usage_logs.created_at`
+/// - `request_logs.created_at`
+///
+/// Conversion: for each field, `datetime(field, '+8 hours')` shifts the
+/// UTC value to Beijing time, then `REPLACE(..., ' ', 'T') || '+08:00'`
+/// reformats to RFC 3339. Rows already in RFC 3339 (containing `T` and
+/// a timezone marker) are left untouched, making the migration safe to
+/// re-run.
+///
+/// Idempotency: uses the same `schema_meta` marker table as v3→v4.
+pub fn migrate_v4_to_v5(conn: &Connection) -> ProxyResult<()> {
+    // Idempotency: check the migration marker.
+    let migrated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='schema_meta'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if migrated > 0 {
+        let done: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_meta WHERE key='v5_iso8601_tz'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if done > 0 {
+            return Ok(());
+        }
+    }
+
+    // Conversion template: shift UTC → Beijing, reformat to RFC 3339.
+    // `datetime(x, '+8 hours')` works correctly for both:
+    //   - legacy `'2026-07-04 17:51:00'` (SQLite treats as UTC, +8h → Beijing)
+    //   - already-migrated `'2026-07-05T01:51:00+08:00'` (SQLite normalizes
+    //     to UTC first, then +8h → Beijing; idempotent)
+    // The WHERE clause skips rows already in RFC 3339 (containing 'T' and
+    // either '+' or 'Z') to avoid double-conversion on re-runs.
+    let convert_sql = |table: &str, col: &str| {
+        format!(
+            "UPDATE {table} SET {col} = \
+                REPLACE(datetime({col}, '+8 hours'), ' ', 'T') || '+08:00' \
+             WHERE {col} IS NOT NULL \
+               AND {col} NOT LIKE '%T%' \
+               AND {col} NOT LIKE '%Z%';"
+        )
+    };
+
+    conn.execute_batch(&format!(
+        "{};{};{};{};{};{};{};{};{};{};{};",
+        convert_sql("models", "created_at"),
+        convert_sql("users", "created_at"),
+        convert_sql("users", "updated_at"),
+        convert_sql("tokens", "created_at"),
+        convert_sql("tokens", "updated_at"),
+        convert_sql("channels", "created_at"),
+        convert_sql("channels", "updated_at"),
+        convert_sql("channel_keys", "created_at"),
+        convert_sql("channel_keys", "updated_at"),
+        convert_sql("discovered_models", "discovered_at"),
+        convert_sql("discovered_models", "last_reset_at"),
+    ))
+    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+
+    // usage_logs and request_logs can be large; update in separate batches
+    // to avoid holding a single large transaction.
+    conn.execute_batch(&format!(
+        "{};{};",
+        convert_sql("usage_logs", "created_at"),
+        convert_sql("request_logs", "created_at"),
+    ))
+    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+
+    // Record the migration marker.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
+         INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('v5_iso8601_tz', 'done');",
+    )
+    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+
+    tracing::info!("migrate_v4_to_v5: converted time fields to RFC 3339 +08:00 (Beijing time)");
     Ok(())
 }
 

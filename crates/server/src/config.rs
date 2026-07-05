@@ -187,9 +187,16 @@ pub fn ensure_default_admin(conn: &Connection) -> ProxyResult<()> {
                 })?;
 
             conn.execute(
-                "INSERT INTO users (username, password_hash, role, status, quota, used_quota, \"group\")
-                 VALUES (?1, ?2, ?3, 1, ?4, 0, 'default')",
-                rusqlite::params!["admin", password_hash, 100, 999_999_999_i64 * QUOTA_PER_YUAN],
+                "INSERT INTO users (username, password_hash, role, status, quota, used_quota, \"group\",
+                                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, 0, 'default', ?5, ?5)",
+                rusqlite::params![
+                    "admin",
+                    password_hash,
+                    100,
+                    999_999_999_i64 * QUOTA_PER_YUAN,
+                    chennix_storage::now_iso8601(),
+                ],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
 

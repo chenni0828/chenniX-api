@@ -2,6 +2,8 @@ use chennix_common::{ChannelConfig, ChannelModelEntry, ChannelProvider, ProxyErr
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
+use crate::now_iso8601;
+
 pub struct ChannelRepo<'a> {
     conn: &'a Connection,
 }
@@ -17,10 +19,12 @@ impl<'a> ChannelRepo<'a> {
         provider: &ChannelProvider,
         base_url: &str,
     ) -> ProxyResult<i64> {
+        let now = now_iso8601();
         self.conn
             .execute(
-                "INSERT INTO channels (name, provider, base_url) VALUES (?1, ?2, ?3)",
-                params![name, provider.to_string(), base_url],
+                "INSERT INTO channels (name, provider, base_url, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![name, provider.to_string(), base_url, now],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(self.conn.last_insert_rowid())
@@ -76,8 +80,8 @@ impl<'a> ChannelRepo<'a> {
     pub fn update_group(&self, id: i64, group: &str) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE channels SET \"group\" = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![group, id],
+                "UPDATE channels SET \"group\" = ?1, updated_at = ?2 WHERE id = ?3",
+                params![group, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -96,11 +100,12 @@ impl<'a> ChannelRepo<'a> {
         base_url: &str,
         group: &str,
     ) -> ProxyResult<i64> {
+        let now = now_iso8601();
         self.conn
             .execute(
-                "INSERT INTO channels (name, provider, base_url, \"group\")
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![name, provider.to_string(), base_url, group],
+                "INSERT INTO channels (name, provider, base_url, \"group\", created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![name, provider.to_string(), base_url, group, now],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(self.conn.last_insert_rowid())
@@ -122,9 +127,9 @@ impl<'a> ChannelRepo<'a> {
             .execute(
                 "UPDATE channels
                  SET name = ?1, provider = ?2, base_url = ?3, \"group\" = ?4,
-                     updated_at = datetime('now')
-                 WHERE id = ?5",
-                params![name, provider.to_string(), base_url, group, id],
+                     updated_at = ?5
+                 WHERE id = ?6",
+                params![name, provider.to_string(), base_url, group, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -255,13 +260,14 @@ impl<'a> DiscoveredModelRepo<'a> {
         source: Option<&str>,
         metadata: Option<&str>,
     ) -> ProxyResult<()> {
+        let now = now_iso8601();
         self.conn
             .execute(
                 "INSERT INTO discovered_models
-                    (channel_id, raw_model_name, is_free, source, metadata)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                    (channel_id, raw_model_name, is_free, source, metadata, discovered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(channel_id, raw_model_name) DO UPDATE SET
-                    discovered_at = datetime('now'),
+                    discovered_at = ?6,
                     is_free = excluded.is_free,
                     source = excluded.source,
                     metadata = excluded.metadata",
@@ -271,6 +277,7 @@ impl<'a> DiscoveredModelRepo<'a> {
                     is_free as i32,
                     source,
                     metadata,
+                    now,
                 ],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
@@ -401,20 +408,21 @@ impl<'a> DiscoveredModelRepo<'a> {
         quota_unit: Option<&str>,
         quota_window: Option<&str>,
     ) -> ProxyResult<()> {
+        let now = now_iso8601();
         self.conn
             .execute(
                 "INSERT INTO discovered_models
                     (channel_id, raw_model_name, quota_limit, quota_unit, quota_window,
-                     used_quota, quota_status, last_reset_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 'available', datetime('now'))
+                     used_quota, quota_status, last_reset_at, discovered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 'available', ?6, ?6)
                  ON CONFLICT(channel_id, raw_model_name) DO UPDATE SET
                     quota_limit = excluded.quota_limit,
                     quota_unit = excluded.quota_unit,
                     quota_window = excluded.quota_window,
                     used_quota = 0,
                     quota_status = 'available',
-                    last_reset_at = datetime('now')",
-                params![channel_id, raw_model_name, quota_limit, quota_unit, quota_window],
+                    last_reset_at = ?6",
+                params![channel_id, raw_model_name, quota_limit, quota_unit, quota_window, now],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -432,9 +440,9 @@ impl<'a> DiscoveredModelRepo<'a> {
                 "UPDATE discovered_models
                  SET used_quota = 0,
                      quota_status = 'available',
-                     last_reset_at = datetime('now')
-                 WHERE channel_id = ?1 AND raw_model_name = ?2",
-                params![channel_id, raw_model_name],
+                     last_reset_at = ?1
+                 WHERE channel_id = ?2 AND raw_model_name = ?3",
+                params![now_iso8601(), channel_id, raw_model_name],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())

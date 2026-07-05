@@ -190,11 +190,12 @@ impl BillingRepoTrait for StorageAdapter {
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
 
         // 1. user 层：条件扣减（quota - used_quota >= amount）
+        let now = chennix_storage::now_iso8601();
         let user_changes = tx
             .execute(
-                "UPDATE users SET used_quota = used_quota + ?1, updated_at = datetime('now')
-                 WHERE id = ?2 AND (quota - used_quota) >= ?1",
-                params![amount, user_id],
+                "UPDATE users SET used_quota = used_quota + ?1, updated_at = ?2
+                 WHERE id = ?3 AND (quota - used_quota) >= ?1",
+                params![amount, now, user_id],
             )
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
         if user_changes == 0 {
@@ -213,9 +214,9 @@ impl BillingRepoTrait for StorageAdapter {
                     "UPDATE tokens
                      SET remain_quota = remain_quota - ?1,
                          used_quota = used_quota + ?1,
-                         updated_at = datetime('now')
-                     WHERE id = ?2 AND remain_quota >= ?1",
-                    params![amount, token_id],
+                         updated_at = ?2
+                     WHERE id = ?3 AND remain_quota >= ?1",
+                    params![amount, now, token_id],
                 )
                 .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
             if token_changes == 0 {
@@ -251,10 +252,11 @@ impl BillingRepoTrait for StorageAdapter {
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
 
         // user 层：无条件调整
+        let now = chennix_storage::now_iso8601();
         tx.execute(
-            "UPDATE users SET used_quota = used_quota + ?1, updated_at = datetime('now')
-             WHERE id = ?2",
-            params![delta, user_id],
+            "UPDATE users SET used_quota = used_quota + ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![delta, now, user_id],
         )
         .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
 
@@ -264,9 +266,9 @@ impl BillingRepoTrait for StorageAdapter {
                 "UPDATE tokens
                  SET remain_quota = remain_quota - ?1,
                      used_quota = used_quota + ?1,
-                     updated_at = datetime('now')
-                 WHERE id = ?2",
-                params![delta, token_id],
+                     updated_at = ?2
+                 WHERE id = ?3",
+                params![delta, now, token_id],
             )
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
         }
@@ -292,10 +294,11 @@ impl BillingRepoTrait for StorageAdapter {
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
 
         // user 层：退还
+        let now = chennix_storage::now_iso8601();
         tx.execute(
-            "UPDATE users SET used_quota = used_quota - ?1, updated_at = datetime('now')
-             WHERE id = ?2",
-            params![amount, user_id],
+            "UPDATE users SET used_quota = used_quota - ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![amount, now, user_id],
         )
         .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
 
@@ -305,9 +308,9 @@ impl BillingRepoTrait for StorageAdapter {
                 "UPDATE tokens
                  SET remain_quota = remain_quota + ?1,
                      used_quota = used_quota - ?1,
-                     updated_at = datetime('now')
-                 WHERE id = ?2",
-                params![amount, token_id],
+                     updated_at = ?2
+                 WHERE id = ?3",
+                params![amount, now, token_id],
             )
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
         }
@@ -380,6 +383,7 @@ impl UsageWriter for StorageAdapter {
         key_label: Option<&str>,
         attempted_keys: Option<&str>,
         upstream_status: Option<i64>,
+        upstream_model: Option<&str>,
         response_status: i64,
         duration_ms: i64,
         stream: bool,
@@ -401,6 +405,7 @@ impl UsageWriter for StorageAdapter {
             key_label,
             attempted_keys,
             upstream_status,
+            upstream_model,
             response_status,
             duration_ms,
             stream,

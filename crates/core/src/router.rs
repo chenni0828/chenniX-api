@@ -3,8 +3,8 @@
 //! Given a list of `(channel, keys, upstream_model_name, priority, weight)`
 //! tuples for a single model, plus the caller's user_group, a key-availability
 //! predicate, a routing strategy and a small-model quota predicate,
-//! `Router::route` produces a flat, ordered list of `RoutedKey` candidates
-//! that the executor should try in order.
+//! `Router::route` produces a **binding-grouped** list of candidate lists
+//! `Vec<Vec<RoutedKey>>` that the executor walks outer = binding, inner = key.
 //!
 //! ## Filtering order (per binding)
 //! 1. **user_group**: only channels whose comma-separated `group` field
@@ -16,15 +16,17 @@
 //!    layer). If a binding's channel ends up with no surviving keys, the
 //!    binding is dropped and the next candidate is tried.
 //!
-//! ## Strategy
-//! - **Priority**: candidates are sorted by (cost_tier, binding_priority,
-//!   key_priority, -quota_ratio, price) and tried in that fixed order.
-//! - **LoadBalance**: candidates are emitted in weighted-random order
-//!   (weight per binding); on each step a candidate is drawn proportional to
-//!   its weight from the remaining pool. Within equal weights, lower
-//!   `binding_priority` breaks ties stably.
+//! ## Strategy (binding-level)
+//! - **Priority**: bindings are sorted by `binding_priority` ascending; keys
+//!   inside a binding are sorted by `key_priority` (+ quota ratio, price).
+//! - **LoadBalance**: bindings are emitted in weighted-random order
+//!   (weight per binding); keys inside a binding are always sorted by
+//!   `key_priority` (key layer is Priority-only by design).
+//!
+//! The key layer has no LoadBalance — `key_priority` (set by drag-and-drop
+//! in the admin UI) fully determines intra-binding order.
 
-use chennix_common::{ChannelConfig, CostTier, KeyConfig};
+use chennix_common::{ChannelConfig, KeyConfig};
 
 use crate::cache::RoutingStrategy;
 
@@ -47,8 +49,9 @@ pub struct RoutedKey {
 pub struct Router;
 
 impl Router {
-    /// Filter, expand and order the channels for a single model into a flat
-    /// list of `RoutedKey`s the executor can walk in order.
+    /// Filter, expand and order the channels for a single model into a
+    /// **binding-grouped** list of candidate lists `Vec<Vec<RoutedKey>>`
+    /// that the executor walks outer = binding, inner = key.
     ///
     /// See the module docs for the filtering order and the strategy branches.
     pub fn route(
@@ -57,7 +60,7 @@ impl Router {
         is_key_available: impl Fn(i64) -> bool,
         strategy: RoutingStrategy,
         quota_filter: impl Fn(i64, &str) -> bool,
-    ) -> Vec<RoutedKey> {
+    ) -> Vec<Vec<RoutedKey>> {
         let group = user_group.trim();
         let group_match = |ch_group: &str| {
             ch_group.split(',').any(|g| g.trim() == group)
@@ -105,74 +108,95 @@ impl Router {
     }
 }
 
-/// Priority mode: flatten + sort by the established multi-key ordering.
-fn route_priority(groups: Vec<Vec<RoutedKey>>) -> Vec<RoutedKey> {
-    let mut candidates: Vec<RoutedKey> = groups.into_iter().flatten().collect();
-    candidates.sort_by(|a, b| {
-        // cost_tier: Free before Paid
-        let a_tier = tier_rank(a.key.cost_tier);
-        let b_tier = tier_rank(b.key.cost_tier);
-        a_tier
-            .cmp(&b_tier)
-            .then(a.binding_priority.cmp(&b.binding_priority))
-            .then(a.key.key_priority.cmp(&b.key.key_priority))
-            .then(
+/// Priority mode: two-layer sort.
+///
+/// 1. Each binding's keys are sorted by `key_priority` → quota remaining
+///    ratio (desc) → price (asc). `cost_tier` is intentionally NOT a sort
+///    key — `binding_priority` is the sole top-level ordering key so the
+///    user's model-management settings are respected.
+/// 2. Bindings are sorted by `binding_priority` ascending (lower = tried
+///    first).
+fn route_priority(mut groups: Vec<Vec<RoutedKey>>) -> Vec<Vec<RoutedKey>> {
+    for bucket in &mut groups {
+        bucket.sort_by(|a, b| {
+            a.key.key_priority.cmp(&b.key.key_priority).then_with(|| {
                 quota_remaining_ratio(&b.key)
                     .partial_cmp(&quota_remaining_ratio(&a.key))
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-            .then(
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }).then_with(|| {
                 price_rank(&a.key.price_per_1k_tokens)
-                    .cmp(&price_rank(&b.key.price_per_1k_tokens)),
-            )
+                    .cmp(&price_rank(&b.key.price_per_1k_tokens))
+            })
+        });
+    }
+    groups.sort_by(|a, b| {
+        a.first()
+            .map(|r| r.binding_priority)
+            .unwrap_or(i32::MAX)
+            .cmp(&b.first().map(|r| r.binding_priority).unwrap_or(i32::MAX))
     });
-    candidates
+    groups
 }
 
-/// LoadBalance mode: weighted-random without replacement.
+/// LoadBalance mode: binding-level weighted-random without replacement.
 ///
-/// Candidates are pre-sorted by `binding_priority` ascending so that, within
-/// equal-weight groups, the draw walks lower-priority candidates first
-/// (stable tie-break). Each step draws a candidate proportional to its
-/// weight (`weight < 1` is clamped to 1) from the remaining pool, removes
-/// it, and repeats — so the emitted order is exactly "weighted random from
-/// the remaining candidates" on each step, matching the executor's
-/// fail-and-try-next loop.
-fn route_load_balance(groups: Vec<Vec<RoutedKey>>) -> Vec<RoutedKey> {
+/// 1. Each binding's keys are sorted by `key_priority` (key layer is always
+///    Priority by design — no LoadBalance at the key layer).
+/// 2. Bindings are pre-sorted by `binding_priority` ascending so that, within
+///    equal-weight groups, the draw walks lower-priority bindings first
+///    (stable tie-break).
+/// 3. Each step draws a *binding* proportional to its weight (`weight < 1`
+///    is clamped to 1) from the remaining pool, removes it, and repeats.
+///    The executor then exhausts the binding's keys before moving to the
+///    next drawn binding.
+fn route_load_balance(mut groups: Vec<Vec<RoutedKey>>) -> Vec<Vec<RoutedKey>> {
     use rand::Rng;
 
-    let mut candidates: Vec<RoutedKey> = groups.into_iter().flatten().collect();
-    if candidates.is_empty() {
-        return candidates;
+    if groups.is_empty() {
+        return groups;
     }
-    candidates.sort_by(|a, b| a.binding_priority.cmp(&b.binding_priority));
+    // 1. key layer: always Priority
+    for bucket in &mut groups {
+        bucket.sort_by(|a, b| {
+            a.key.key_priority.cmp(&b.key.key_priority).then_with(|| {
+                quota_remaining_ratio(&b.key)
+                    .partial_cmp(&quota_remaining_ratio(&a.key))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }).then_with(|| {
+                price_rank(&a.key.price_per_1k_tokens)
+                    .cmp(&price_rank(&b.key.price_per_1k_tokens))
+            })
+        });
+    }
+    // 2. pre-sort by binding_priority (stable tiebreak for equal weights)
+    groups.sort_by(|a, b| {
+        a.first()
+            .map(|r| r.binding_priority)
+            .unwrap_or(i32::MAX)
+            .cmp(&b.first().map(|r| r.binding_priority).unwrap_or(i32::MAX))
+    });
 
+    // 3. binding-level weighted random without replacement
+    let binding_weight = |b: &Vec<RoutedKey>| -> i64 {
+        b.first().map(|r| r.weight.max(1) as i64).unwrap_or(1)
+    };
     let mut rng = rand::thread_rng();
-    let mut out: Vec<RoutedKey> = Vec::with_capacity(candidates.len());
-    while !candidates.is_empty() {
-        // total >= 1: pool is non-empty and weights are clamped to >= 1.
-        let total: i64 = candidates.iter().map(|c| c.weight.max(1) as i64).sum();
+    let mut out: Vec<Vec<RoutedKey>> = Vec::with_capacity(groups.len());
+    while !groups.is_empty() {
+        let total: i64 = groups.iter().map(binding_weight).sum();
         let pick = rng.gen_range(0..total);
         let mut acc: i64 = 0;
-        let mut chosen = candidates.len() - 1;
-        for (i, c) in candidates.iter().enumerate() {
-            acc += c.weight.max(1) as i64;
+        let mut chosen = groups.len() - 1;
+        for (i, b) in groups.iter().enumerate() {
+            acc += binding_weight(b);
             if pick < acc {
                 chosen = i;
                 break;
             }
         }
-        out.push(candidates.remove(chosen));
+        out.push(groups.remove(chosen));
     }
     out
-}
-
-/// Free = 0 (sorts first), Paid = 1.
-fn tier_rank(t: CostTier) -> u8 {
-    match t {
-        CostTier::Free => 0,
-        CostTier::Paid => 1,
-    }
 }
 
 /// `None` price (unknown) sorts after `Some(_)` so free-tier / priced keys
@@ -211,7 +235,7 @@ fn quota_remaining_ratio(k: &KeyConfig) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chennix_common::{ChannelProvider, KeyStatus};
+    use chennix_common::{ChannelProvider, CostTier, KeyStatus};
 
     fn channel(id: i64, group: &str) -> ChannelConfig {
         ChannelConfig {
@@ -250,15 +274,18 @@ mod tests {
     #[test]
     fn test_free_before_paid() {
         // Same binding_priority + key_priority — Free must come first.
+        // (cost_tier is no longer a sort key, but Free key has price 0.0
+        // which sorts before Paid key's price 0.01 via price_rank tiebreaker.)
         let ch = channel(1, "default");
         let paid = key(10, 1, CostTier::Paid, 100, Some(0.01));
         let free = key(11, 1, CostTier::Free, 100, Some(0.0));
         let input = vec![(ch.clone(), vec![paid, free], "upstream".into(), 100, 1)];
 
         let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].key.cost_tier, CostTier::Free);
-        assert_eq!(out[1].key.cost_tier, CostTier::Paid);
+        assert_eq!(out.len(), 1); // 1 binding
+        assert_eq!(out[0].len(), 2); // 2 keys in the binding
+        assert_eq!(out[0][0].key.cost_tier, CostTier::Free);
+        assert_eq!(out[0][1].key.cost_tier, CostTier::Paid);
     }
 
     #[test]
@@ -274,10 +301,10 @@ mod tests {
         ];
 
         let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 2); // 2 bindings
         // channel 2 has binding_priority 10 → comes first
-        assert_eq!(out[0].channel.id, 2);
-        assert_eq!(out[1].channel.id, 1);
+        assert_eq!(out[0][0].channel.id, 2);
+        assert_eq!(out[1][0].channel.id, 1);
     }
 
     #[test]
@@ -299,13 +326,13 @@ mod tests {
 
         // vip user → ch1 + ch2
         let out_vip = Router::route(input.clone(), "vip", all_available, RoutingStrategy::Priority, quota_ok);
-        let mut ids: Vec<i64> = out_vip.iter().map(|r| r.channel.id).collect();
+        let mut ids: Vec<i64> = out_vip.iter().flatten().map(|r| r.channel.id).collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
 
         // default user → ch1 + ch3
         let out_def = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        let mut ids: Vec<i64> = out_def.iter().map(|r| r.channel.id).collect();
+        let mut ids: Vec<i64> = out_def.iter().flatten().map(|r| r.channel.id).collect();
         ids.sort();
         assert_eq!(ids, vec![1, 3]);
     }
@@ -319,8 +346,9 @@ mod tests {
         let input = vec![(ch, vec![k_ok.clone(), k_down], "u".into(), 100, 1)];
 
         let out = Router::route(input, "default", |id| id == 10, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].key.id, 10);
+        assert_eq!(out.len(), 1); // 1 binding
+        assert_eq!(out[0].len(), 1); // 1 surviving key
+        assert_eq!(out[0][0].key.id, 10);
     }
 
     #[test]
@@ -338,10 +366,11 @@ mod tests {
 
         let input = vec![(ch, vec![k_low, k_high], "u".into(), 100, 1)];
         let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 1); // 1 binding
+        assert_eq!(out[0].len(), 2); // 2 keys
         // k_high (more remaining) first, even though it's pricier
-        assert_eq!(out[0].key.id, 11);
-        assert_eq!(out[1].key.id, 10);
+        assert_eq!(out[0][0].key.id, 11);
+        assert_eq!(out[0][1].key.id, 10);
     }
 
     #[test]
@@ -352,8 +381,8 @@ mod tests {
         let input = vec![(ch, vec![k_pricey, k_cheap], "u".into(), 100, 1)];
 
         let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out[0].key.id, 10); // cheap first
-        assert_eq!(out[1].key.id, 11);
+        assert_eq!(out[0][0].key.id, 10); // cheap first
+        assert_eq!(out[0][1].key.id, 11);
     }
 
     #[test]
@@ -376,13 +405,13 @@ mod tests {
         let input = vec![(ch, vec![k], "u".into(), 50, 7)];
         let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].weight, 7);
-        assert_eq!(out[0].binding_priority, 50);
+        assert_eq!(out[0][0].weight, 7);
+        assert_eq!(out[0][0].binding_priority, 50);
     }
 
     #[test]
     fn test_load_balance_prefers_higher_weight() {
-        // Two bindings with weights 1 and 9. The weight-9 candidate should
+        // Two bindings with weights 1 and 9. The weight-9 binding should
         // be picked first the large majority of the time (~90%).
         let ch_a = channel(1, "default");
         let ch_b = channel(2, "default");
@@ -403,14 +432,14 @@ mod tests {
                 quota_ok,
             );
             assert_eq!(out.len(), 2);
-            if out[0].key.id == 11 {
+            if out[0][0].key.id == 11 {
                 first_b += 1;
             }
         }
         // Expected ~1800/2000. Threshold 1400 (70%) avoids flakiness.
         assert!(
             first_b > 1400,
-            "weight-9 candidate should dominate first pick, got {first_b}/2000"
+            "weight-9 binding should dominate first pick, got {first_b}/2000"
         );
     }
 
@@ -432,7 +461,7 @@ mod tests {
             quota_ok,
         );
         assert_eq!(out.len(), 2);
-        let mut ids: Vec<i64> = out.iter().map(|r| r.key.id).collect();
+        let mut ids: Vec<i64> = out.iter().flatten().map(|r| r.key.id).collect();
         ids.sort();
         assert_eq!(ids, vec![10, 11]);
     }
@@ -456,7 +485,7 @@ mod tests {
             |ch_id, _up| ch_id != 1,
         );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].channel.id, 2);
+        assert_eq!(out[0][0].channel.id, 2);
     }
 
     #[test]
@@ -479,7 +508,7 @@ mod tests {
             |ch_id, _up| ch_id != 1,
         );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].channel.id, 2);
+        assert_eq!(out[0][0].channel.id, 2);
     }
 
     #[test]
@@ -502,6 +531,6 @@ mod tests {
             quota_ok,
         );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].channel.id, 2);
+        assert_eq!(out[0][0].channel.id, 2);
     }
 }

@@ -2,7 +2,7 @@ import { Fragment, useEffect, useState, useCallback } from "react"
 import {
   Plus, RefreshCw, Pencil, Trash2, Key, ArrowLeft, Loader2, Server,
   HelpCircle, ChevronDown, ChevronRight, Zap, Copy, Check,
-  Gauge, RotateCcw, Search,
+  Gauge, RotateCcw, Search, GripVertical,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -30,7 +30,7 @@ import {
   type SmallModel, type QuotaUnit, type QuotaWindow,
 } from "@/lib/api/models"
 import { toast } from "@/hooks/use-toast"
-import { copyToClipboard } from "@/lib/format"
+import { copyToClipboard, formatDate } from "@/lib/format"
 
 // ===== Constants & Helpers =====
 
@@ -84,7 +84,6 @@ interface ChannelFormState {
 interface KeyFormState {
   api_key: string
   is_free: boolean
-  priority: number
   quota_limit: number
   price_per_1k_tokens: number
   status: string
@@ -95,7 +94,7 @@ const emptyChannelForm: ChannelFormState = {
 }
 
 const emptyKeyForm: KeyFormState = {
-  api_key: "", is_free: false, priority: 0, quota_limit: 0, price_per_1k_tokens: 0, status: "active",
+  api_key: "", is_free: false, quota_limit: 0, price_per_1k_tokens: 0, status: "active",
 }
 
 // ===== Main Component =====
@@ -128,6 +127,10 @@ export default function Channels() {
   const [deletingKey, setDeletingKey] = useState(false)
   const [resettingKey, setResettingKey] = useState<Set<number>>(new Set())
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
+
+  // Key 拖拽排序 state
+  const [draggingKeyId, setDraggingKeyId] = useState<number | null>(null)
+  const [dragOverKeyId, setDragOverKeyId] = useState<number | null>(null)
 
   // Reload state
   const [reloading, setReloading] = useState(false)
@@ -504,14 +507,12 @@ export default function Channels() {
       group: ch.group,
     })
     setChannelDialogOpen(true)
-    // Pre-fill the first available API key for convenience
+    // 编辑模式下载入 keys 列表，供"已配置 N 个 Key"显示使用
     try {
-      const keys = await channelApi.listKeys(ch.id)
-      const firstActive = keys.find(k => k.status === "active")
-      const key = (firstActive || keys[0])?.api_key || ""
-      setChannelForm(f => ({ ...f, api_key: key }))
+      const data = await channelApi.listKeys(ch.id)
+      setKeys(data)
     } catch {
-      // ignore
+      setKeys([])
     }
   }
 
@@ -549,7 +550,6 @@ export default function Channels() {
             await channelApi.createKey(channelId, {
               api_key: channelForm.api_key.trim(),
               is_free: false,
-              priority: 0,
               quota_limit: 0,
               price_per_1k_tokens: 0,
             })
@@ -628,6 +628,51 @@ export default function Channels() {
     }
   }
 
+  // ===== Key 拖拽排序 handlers =====
+
+  const handleKeyDragStart = (e: React.DragEvent, keyId: number) => {
+    e.dataTransfer.setData("text/plain", String(keyId))
+    e.dataTransfer.effectAllowed = "move"
+    setDraggingKeyId(keyId)
+  }
+
+  const handleKeyDragOver = (e: React.DragEvent, keyId: number) => {
+    e.preventDefault()
+    if (draggingKeyId !== null && draggingKeyId !== keyId) {
+      setDragOverKeyId(keyId)
+    }
+  }
+
+  const handleKeyDrop = async (e: React.DragEvent, targetKeyId: number) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (draggingKeyId === null || draggingKeyId === targetKeyId) {
+      setDraggingKeyId(null); setDragOverKeyId(null); return
+    }
+    const ordered = [...keys]
+    const fromIdx = ordered.findIndex(k => k.id === draggingKeyId)
+    const toIdx = ordered.findIndex(k => k.id === targetKeyId)
+    if (fromIdx === -1 || toIdx === -1) {
+      setDraggingKeyId(null); setDragOverKeyId(null); return
+    }
+    const [moved] = ordered.splice(fromIdx, 1)
+    ordered.splice(toIdx, 0, moved)
+    setDraggingKeyId(null); setDragOverKeyId(null)
+    if (!keyChannel) return
+    try {
+      await channelApi.reorderKeys(keyChannel.id, ordered.map(k => k.id))
+      toast({ title: "优先级已更新" })
+      await refreshKeys(keyChannel.id)
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || "排序失败"
+      toast({ title: msg, variant: "destructive" })
+    }
+  }
+
+  const handleKeyDragEnd = () => {
+    setDraggingKeyId(null); setDragOverKeyId(null)
+  }
+
   const openCreateKey = () => {
     setEditingKey(null)
     setKeyForm(emptyKeyForm)
@@ -639,7 +684,6 @@ export default function Channels() {
     setKeyForm({
       api_key: key.api_key,
       is_free: key.cost_tier === "free",
-      priority: key.key_priority,
       quota_limit: key.free_quota ?? 0,
       price_per_1k_tokens: key.price_per_1k_tokens ?? 0,
       status: statusToValue(key.status),
@@ -653,13 +697,22 @@ export default function Channels() {
       toast({ title: "请输入 API Key", variant: "destructive" })
       return
     }
+    // 同渠道内 api_key 唯一性前端校验（编辑时排除自身）
+    const trimmedKey = keyForm.api_key.trim()
+    const duplicate = keys.some(
+      k => k.api_key === trimmedKey && (!editingKey || k.id !== editingKey.id)
+    )
+    if (duplicate) {
+      toast({ title: "该渠道下已存在相同的 API Key", variant: "destructive" })
+      return
+    }
     setSavingKey(true)
     try {
       if (editingKey) {
         const data: UpdateKeyData = {
           api_key: keyForm.api_key.trim(),
           is_free: keyForm.is_free,
-          priority: keyForm.priority,
+          priority: editingKey.key_priority,
           quota_limit: keyForm.quota_limit,
           price_per_1k_tokens: keyForm.price_per_1k_tokens,
           status: keyForm.status,
@@ -670,7 +723,6 @@ export default function Channels() {
         const data: CreateKeyData = {
           api_key: keyForm.api_key.trim(),
           is_free: keyForm.is_free,
-          priority: keyForm.priority,
           quota_limit: keyForm.quota_limit,
           price_per_1k_tokens: keyForm.price_per_1k_tokens,
         }
@@ -986,14 +1038,32 @@ export default function Channels() {
             </div>
             <div className="space-y-2">
               <Label htmlFor="ch-apikey">API Key</Label>
-              <Input
-                id="ch-apikey"
-                type="password"
-                value={channelForm.api_key}
-                onChange={(e) => setChannelForm(f => ({ ...f, api_key: e.target.value }))}
-                placeholder="sk-..."
-              />
-              <p className="text-xs text-muted-foreground">保存渠道时将自动创建 Key</p>
+              {editingChannel ? (
+                <Button
+                  variant="outline"
+                  className="w-full justify-between"
+                  onClick={() => {
+                    setChannelDialogOpen(false)
+                    openKeyManager(editingChannel)
+                  }}
+                >
+                  <span className="text-muted-foreground">
+                    {keys.length > 0 ? `已配置 ${keys.length} 个 Key，点击管理` : "尚未配置 Key，点击添加"}
+                  </span>
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              ) : (
+                <>
+                  <Input
+                    id="ch-apikey"
+                    type="password"
+                    value={channelForm.api_key}
+                    onChange={(e) => setChannelForm(f => ({ ...f, api_key: e.target.value }))}
+                    placeholder="sk-..."
+                  />
+                  <p className="text-xs text-muted-foreground">保存渠道时将自动创建 Key，后续可在渠道列表用「管理 Key」按钮增删</p>
+                </>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor="ch-group">分组</Label>
@@ -1007,19 +1077,6 @@ export default function Channels() {
 
           </div>
           <DialogFooter>
-            {editingChannel && (
-              <Button
-                variant="outline"
-                className="mr-auto"
-                onClick={() => {
-                  setChannelDialogOpen(false)
-                  openKeyManager(editingChannel)
-                }}
-              >
-                <Key className="mr-2 h-4 w-4" />
-                管理 API Key
-              </Button>
-            )}
             <Button variant="outline" onClick={() => setChannelDialogOpen(false)}>取消</Button>
             <Button onClick={handleSaveChannel} disabled={savingChannel}>
               {savingChannel && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
@@ -1088,9 +1145,9 @@ export default function Channels() {
                   <Table>
                     <TableHeader>
                       <TableRow>
+                        <TableHead className="w-10"></TableHead>
                         <TableHead>API Key</TableHead>
                         <TableHead>类型</TableHead>
-                        <TableHead className="text-right">优先级</TableHead>
                         <TableHead className="text-right">额度</TableHead>
                         <TableHead>状态</TableHead>
                         <TableHead className="text-right">操作</TableHead>
@@ -1098,7 +1155,24 @@ export default function Channels() {
                     </TableHeader>
                     <TableBody>
                       {keys.map((k) => (
-                        <TableRow key={k.id}>
+                        <TableRow
+                          key={k.id}
+                          draggable
+                          onDragStart={(e) => handleKeyDragStart(e, k.id)}
+                          onDragOver={(e) => handleKeyDragOver(e, k.id)}
+                          onDrop={(e) => handleKeyDrop(e, k.id)}
+                          onDragEnd={handleKeyDragEnd}
+                          className={
+                            draggingKeyId === k.id
+                              ? "opacity-50"
+                              : dragOverKeyId === k.id
+                              ? "border-t-2 border-t-primary"
+                              : ""
+                          }
+                        >
+                          <TableCell className="w-10 cursor-grab active:cursor-grabbing">
+                            <GripVertical className="h-4 w-4 text-muted-foreground" />
+                          </TableCell>
                           <TableCell className="font-mono text-xs">
                             <div className="flex items-center gap-1">
                               <span className="break-all">{maskKey(k.api_key)}</span>
@@ -1129,7 +1203,6 @@ export default function Channels() {
                               {k.cost_tier === "free" ? "免费" : "付费"}
                             </Badge>
                           </TableCell>
-                          <TableCell className="text-right tabular-nums">{k.key_priority}</TableCell>
                           <TableCell className="text-right tabular-nums text-muted-foreground">
                             {k.free_quota ? `${k.used_quota}/${k.free_quota}` : k.used_quota}
                           </TableCell>
@@ -1201,17 +1274,8 @@ export default function Channels() {
                     onCheckedChange={(v) => setKeyForm(f => ({ ...f, is_free: v }))}
                   />
                 </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="key-priority">优先级</Label>
-                    <Input
-                      id="key-priority"
-                      type="number"
-                      value={keyForm.priority}
-                      onChange={(e) => setKeyForm(f => ({ ...f, priority: parseInt(e.target.value) || 0 }))}
-                    />
-                  </div>
-                  {editingKey && (
+                {editingKey && (
+                  <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
                       <Label htmlFor="key-status">状态</Label>
                       <Select
@@ -1228,8 +1292,8 @@ export default function Channels() {
                         </SelectContent>
                       </Select>
                     </div>
-                  )}
-                </div>
+                  </div>
+                )}
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <Label htmlFor="key-quota">额度限制</Label>
@@ -1304,7 +1368,7 @@ export default function Channels() {
                   <p>当前已用：{formatQuotaNumber(sm.used_quota)} {unitLabel(unit)}
                     {sm.quota_limit != null && ` / ${formatQuotaNumber(sm.quota_limit)}`}</p>
                   {sm.last_reset_at && (
-                    <p>上次重置：{new Date(sm.last_reset_at).toLocaleString()}</p>
+                    <p>上次重置：{formatDate(sm.last_reset_at)}</p>
                   )}
                 </div>
               )

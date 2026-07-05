@@ -117,6 +117,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             "/admin/api/channels/:id/keys/:kid/reset-quota",
             post(reset_key_quota_handler),
         )
+        .route(
+            "/admin/api/channels/:id/keys/reorder",
+            put(reorder_keys_handler),
+        )
         // Models CRUD
         .route("/admin/api/models", get(list_models_handler).post(create_model_handler))
         .route(

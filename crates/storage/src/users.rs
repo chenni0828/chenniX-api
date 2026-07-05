@@ -1,6 +1,8 @@
 use chennix_common::{ProxyError, ProxyResult, UserConfig};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::now_iso8601;
+
 pub struct UserRepo<'a> {
     conn: &'a Connection,
 }
@@ -24,11 +26,13 @@ impl<'a> UserRepo<'a> {
         role: i32,
         group: &str,
     ) -> ProxyResult<i64> {
+        let now = now_iso8601();
         self.conn
             .execute(
-                "INSERT INTO users (username, password_hash, role, status, \"group\")
-                 VALUES (?1, ?2, ?3, 1, ?4)",
-                params![username, password_hash, role, group],
+                "INSERT INTO users (username, password_hash, role, status, \"group\",
+                                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5, ?5)",
+                params![username, password_hash, role, group, now],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(self.conn.last_insert_rowid())
@@ -67,8 +71,8 @@ impl<'a> UserRepo<'a> {
     pub fn update_quota(&self, id: i64, new_quota: i64) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE users SET quota = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![new_quota, id],
+                "UPDATE users SET quota = ?1, updated_at = ?2 WHERE id = ?3",
+                params![new_quota, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -78,9 +82,9 @@ impl<'a> UserRepo<'a> {
     pub fn update_used_quota_delta(&self, id: i64, delta: i64) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE users SET used_quota = used_quota + ?1, updated_at = datetime('now')
-                 WHERE id = ?2",
-                params![delta, id],
+                "UPDATE users SET used_quota = used_quota + ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![delta, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -107,8 +111,8 @@ impl<'a> UserRepo<'a> {
     pub fn update_status(&self, id: i64, status: i32) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE users SET status = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![status, id],
+                "UPDATE users SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -147,11 +151,13 @@ impl<'a> UserRepo<'a> {
         group: &str,
         quota: i64,
     ) -> ProxyResult<i64> {
+        let now = now_iso8601();
         self.conn
             .execute(
-                "INSERT INTO users (username, password_hash, role, status, quota, used_quota, \"group\")
-                 VALUES (?1, ?2, ?3, 1, ?4, 0, ?5)",
-                params![username, password_hash, role, quota, group],
+                "INSERT INTO users (username, password_hash, role, status, quota, used_quota, \"group\",
+                                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, 0, ?5, ?6, ?6)",
+                params![username, password_hash, role, quota, group, now],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(self.conn.last_insert_rowid())
@@ -174,9 +180,9 @@ impl<'a> UserRepo<'a> {
             .execute(
                 "UPDATE users
                  SET username = ?1, role = ?2, status = ?3, \"group\" = ?4,
-                     quota = ?5, updated_at = datetime('now')
-                 WHERE id = ?6",
-                params![username, role, status, group, quota, id],
+                     quota = ?5, updated_at = ?6
+                 WHERE id = ?7",
+                params![username, role, status, group, quota, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
@@ -189,9 +195,9 @@ impl<'a> UserRepo<'a> {
     pub fn update_password(&self, id: i64, password_hash: &str) -> ProxyResult<()> {
         self.conn
             .execute(
-                "UPDATE users SET password_hash = ?1, updated_at = datetime('now')
-                 WHERE id = ?2",
-                params![password_hash, id],
+                "UPDATE users SET password_hash = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![password_hash, now_iso8601(), id],
             )
             .map_err(|e| ProxyError::Storage(e.to_string()))?;
         Ok(())
