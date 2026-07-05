@@ -110,24 +110,13 @@ impl Router {
 
 /// Priority mode: two-layer sort.
 ///
-/// 1. Each binding's keys are sorted by `key_priority` → quota remaining
-///    ratio (desc) → price (asc). `cost_tier` is intentionally NOT a sort
-///    key — `binding_priority` is the sole top-level ordering key so the
-///    user's model-management settings are respected.
+/// 1. Each binding's keys are sorted by `key_priority` only. When priorities
+///    are equal, the original database order (stable sort) is preserved.
 /// 2. Bindings are sorted by `binding_priority` ascending (lower = tried
 ///    first).
 fn route_priority(mut groups: Vec<Vec<RoutedKey>>) -> Vec<Vec<RoutedKey>> {
     for bucket in &mut groups {
-        bucket.sort_by(|a, b| {
-            a.key.key_priority.cmp(&b.key.key_priority).then_with(|| {
-                quota_remaining_ratio(&b.key)
-                    .partial_cmp(&quota_remaining_ratio(&a.key))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }).then_with(|| {
-                price_rank(&a.key.price_per_1k_tokens)
-                    .cmp(&price_rank(&b.key.price_per_1k_tokens))
-            })
-        });
+        bucket.sort_by(|a, b| a.key.key_priority.cmp(&b.key.key_priority));
     }
     groups.sort_by(|a, b| {
         a.first()
@@ -157,16 +146,7 @@ fn route_load_balance(mut groups: Vec<Vec<RoutedKey>>) -> Vec<Vec<RoutedKey>> {
     }
     // 1. key layer: always Priority
     for bucket in &mut groups {
-        bucket.sort_by(|a, b| {
-            a.key.key_priority.cmp(&b.key.key_priority).then_with(|| {
-                quota_remaining_ratio(&b.key)
-                    .partial_cmp(&quota_remaining_ratio(&a.key))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }).then_with(|| {
-                price_rank(&a.key.price_per_1k_tokens)
-                    .cmp(&price_rank(&b.key.price_per_1k_tokens))
-            })
-        });
+        bucket.sort_by(|a, b| a.key.key_priority.cmp(&b.key.key_priority));
     }
     // 2. pre-sort by binding_priority (stable tiebreak for equal weights)
     groups.sort_by(|a, b| {
@@ -197,39 +177,6 @@ fn route_load_balance(mut groups: Vec<Vec<RoutedKey>>) -> Vec<Vec<RoutedKey>> {
         out.push(groups.remove(chosen));
     }
     out
-}
-
-/// `None` price (unknown) sorts after `Some(_)` so free-tier / priced keys
-/// come first. Within `Some`, cheaper sorts first — that falls out of f64
-/// total ordering. To get a stable `Ord`, we convert to bits.
-fn price_rank(price: &Option<f64>) -> u64 {
-    match price {
-        None => u64::MAX,
-        Some(p) => {
-            if p.is_nan() || *p < 0.0 {
-                // treat invalid as "unknown"
-                u64::MAX
-            } else {
-                // f64 to bits preserves total ordering for non-negative
-                // non-NaN floats (IEEE 754 layout).
-                p.to_bits()
-            }
-        }
-    }
-}
-
-/// `used_quota / free_quota` clamped to `[0, 1]`. Higher ratio = closer
-/// to exhaustion = should sort later. Keys with no `free_quota` are
-/// treated as fully unused (ratio 0).
-fn quota_remaining_ratio(k: &KeyConfig) -> f64 {
-    match k.free_quota {
-        Some(total) if total > 0 => {
-            let used = k.used_quota.min(total);
-            // remaining ratio = (total - used) / total
-            (total - used) as f64 / total as f64
-        }
-        _ => 1.0, // no quota limit → "fully remaining"
-    }
 }
 
 #[cfg(test)]
@@ -272,20 +219,18 @@ mod tests {
     }
 
     #[test]
-    fn test_free_before_paid() {
-        // Same binding_priority + key_priority — Free must come first.
-        // (cost_tier is no longer a sort key, but Free key has price 0.0
-        // which sorts before Paid key's price 0.01 via price_rank tiebreaker.)
+    fn test_key_priority_order() {
+        // Same binding_priority; key_priority determines order.
         let ch = channel(1, "default");
-        let paid = key(10, 1, CostTier::Paid, 100, Some(0.01));
-        let free = key(11, 1, CostTier::Free, 100, Some(0.0));
-        let input = vec![(ch.clone(), vec![paid, free], "upstream".into(), 100, 1)];
+        let k_low = key(10, 1, CostTier::Paid, 50, Some(0.01));
+        let k_high = key(11, 1, CostTier::Paid, 100, Some(0.0));
+        let input = vec![(ch.clone(), vec![k_high, k_low], "upstream".into(), 100, 1)];
 
         let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out.len(), 1); // 1 binding
-        assert_eq!(out[0].len(), 2); // 2 keys in the binding
-        assert_eq!(out[0][0].key.cost_tier, CostTier::Free);
-        assert_eq!(out[0][1].key.cost_tier, CostTier::Paid);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 2);
+        assert_eq!(out[0][0].key.id, 10); // priority 50 first
+        assert_eq!(out[0][1].key.id, 11);
     }
 
     #[test]
@@ -349,40 +294,6 @@ mod tests {
         assert_eq!(out.len(), 1); // 1 binding
         assert_eq!(out[0].len(), 1); // 1 surviving key
         assert_eq!(out[0][0].key.id, 10);
-    }
-
-    #[test]
-    fn test_sort_full_chain_tie_breakers() {
-        // Two candidates: same tier, same binding_priority, same key_priority.
-        // Different remaining ratio and price — ratio wins (higher ratio first).
-        let ch = channel(1, "default");
-        let mut k_low = key(10, 1, CostTier::Paid, 100, Some(0.01));
-        k_low.free_quota = Some(1000);
-        k_low.used_quota = 900; // 10% remaining
-
-        let mut k_high = key(11, 1, CostTier::Paid, 100, Some(0.05));
-        k_high.free_quota = Some(1000);
-        k_high.used_quota = 100; // 90% remaining
-
-        let input = vec![(ch, vec![k_low, k_high], "u".into(), 100, 1)];
-        let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out.len(), 1); // 1 binding
-        assert_eq!(out[0].len(), 2); // 2 keys
-        // k_high (more remaining) first, even though it's pricier
-        assert_eq!(out[0][0].key.id, 11);
-        assert_eq!(out[0][1].key.id, 10);
-    }
-
-    #[test]
-    fn test_price_tiebreaker_when_ratio_equal() {
-        let ch = channel(1, "default");
-        let k_cheap = key(10, 1, CostTier::Paid, 100, Some(0.01));
-        let k_pricey = key(11, 1, CostTier::Paid, 100, Some(0.50));
-        let input = vec![(ch, vec![k_pricey, k_cheap], "u".into(), 100, 1)];
-
-        let out = Router::route(input, "default", all_available, RoutingStrategy::Priority, quota_ok);
-        assert_eq!(out[0][0].key.id, 10); // cheap first
-        assert_eq!(out[0][1].key.id, 11);
     }
 
     #[test]
