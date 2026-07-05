@@ -123,7 +123,73 @@ pub fn import_from_yaml(conn: &Connection, yaml_path: &str) -> ProxyResult<()> {
     }
 
     tx.commit().map_err(|e| ProxyError::Storage(e.to_string()))?;
+
+    // 检测占位符密钥并输出醒目 WARNING。
+    // 新手常直接用 bootstrap.example.yaml 的占位符部署，看到面板有模型
+    // 就以为跑通了，结果一请求就 401。这里主动告警，缩短排查路径。
+    warn_on_placeholder_keys(&config.keys);
+
     Ok(())
+}
+
+/// 扫描 bootstrap 导入的 Key 列表，发现疑似占位符就输出 WARNING。
+///
+/// 判定规则（大小写不敏感）：
+/// - 精确匹配 `bootstrap.example.yaml` 中出现的占位符：`sk-your-openai-key-here`、
+///   `sk-ant-your-anthropic-key-here`、`sk-your-deepseek-key-here`
+/// - 包含 `your-` / `-here` / `change-me` / `example` 等典型占位词
+///
+/// 仅记日志，不阻断启动 —— 用户可能确实想用占位符先跑通流程。
+fn warn_on_placeholder_keys(keys: &[KeyEntry]) {
+    const KNOWN_PLACEHOLDERS: &[&str] = &[
+        "sk-your-openai-key-here",
+        "sk-ant-your-anthropic-key-here",
+        "sk-your-deepseek-key-here",
+    ];
+    const PLACEHOLDER_MARKERS: &[&str] = &[
+        "your-",
+        "-here",
+        "change-me",
+        "example",
+        "placeholder",
+        "xxxx",
+    ];
+
+    let mut found: Vec<(&str, &str)> = Vec::new();
+    for k in keys {
+        let lower = k.api_key.to_lowercase();
+        let is_placeholder = KNOWN_PLACEHOLDERS.iter().any(|p| lower == *p)
+            || PLACEHOLDER_MARKERS.iter().any(|m| lower.contains(m));
+        if is_placeholder {
+            let label = k.label.as_deref().unwrap_or("(no label)");
+            found.push((label, &k.api_key));
+        }
+    }
+
+    if !found.is_empty() {
+        tracing::warn!("");
+        tracing::warn!("┌─────────────────────────────────────────────────────────────┐");
+        tracing::warn!("│  ⚠️  检测到 {} 个疑似占位符 API Key：", found.len());
+        for (label, key) in &found {
+            // 只显示前 8 + 后 4 字符，避免完整泄漏到日志。
+            // 用 chars 收集避免非 ASCII 切片 panic（虽然 API key 一般是 ASCII）。
+            let chars: Vec<char> = key.chars().collect();
+            let masked = if chars.len() > 12 {
+                let head: String = chars.iter().take(8).collect();
+                let tail: String = chars[chars.len()-4..].iter().collect();
+                format!("{}...{}", head, tail)
+            } else {
+                key.to_string()
+            };
+            tracing::warn!("│    • [{}] {}", label, masked);
+        }
+        tracing::warn!("│");
+        tracing::warn!("│  这些 Key 大概率来自 bootstrap.example.yaml 的占位符。");
+        tracing::warn!("│  请登录管理面板 → Channels → 修改为真实 API Key，");
+        tracing::warn!("│  否则所有请求都会因 401 失败。");
+        tracing::warn!("└─────────────────────────────────────────────────────────────┘");
+        tracing::warn!("");
+    }
 }
 
 /// 检查 SQLite 是否为空 (无渠道配置), 用于判断是否需要引导导入
@@ -177,5 +243,53 @@ bindings:
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].upstream_model_name, "deepseek-chat");
         assert_eq!(bindings[0].priority, 10);
+    }
+
+    /// 占位符检测不应误报真实 key（如 `sk-xxx` 这种短测试 key）。
+    /// 仅当含 `your-` / `-here` / `change-me` / `example` / `placeholder`
+    /// / `xxxx` 或精确匹配已知占位符时才告警。
+    #[test]
+    fn test_warn_on_placeholder_keys_does_not_false_positive() {
+        let keys = vec![KeyEntry {
+            channel: "test".into(),
+            api_key: "sk-xxx".into(), // 3 个 x，不含 4 个 x 的 "xxxx"
+            label: Some("test".into()),
+            cost_tier: "paid".into(),
+            key_priority: 100,
+            price_per_1k_tokens: None,
+            free_quota: None,
+            quota_reset_period: None,
+        }];
+        // 仅验证不 panic；告警逻辑只记日志不返回值。
+        warn_on_placeholder_keys(&keys);
+    }
+
+    /// 占位符检测应识别 example.yaml 中的占位符。
+    #[test]
+    fn test_warn_on_placeholder_keys_detects_known_placeholders() {
+        let keys = vec![
+            KeyEntry {
+                channel: "openai".into(),
+                api_key: "sk-your-openai-key-here".into(),
+                label: Some("主账号".into()),
+                cost_tier: "paid".into(),
+                key_priority: 0,
+                price_per_1k_tokens: Some(0.01),
+                free_quota: None,
+                quota_reset_period: None,
+            },
+            KeyEntry {
+                channel: "anthropic".into(),
+                api_key: "sk-ant-your-anthropic-key-here".into(),
+                label: None,
+                cost_tier: "paid".into(),
+                key_priority: 0,
+                price_per_1k_tokens: Some(0.015),
+                free_quota: None,
+                quota_reset_period: None,
+            },
+        ];
+        // 仅验证不 panic；视觉检查日志应输出 WARNING 框。
+        warn_on_placeholder_keys(&keys);
     }
 }

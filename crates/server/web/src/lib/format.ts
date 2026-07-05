@@ -7,11 +7,8 @@
  *
  * 输入支持：
  * - Unix 时间戳（秒，number）
- * - RFC 3339 带时区字符串（新格式，如 "2026-07-05T01:51:00+08:00"），
+ * - RFC 3339 带时区字符串（如 "2026-07-05T01:51:00+08:00"），
  *   JS `new Date()` 原生解析，能正确处理时区偏移。
- * - SQLite datetime('now') 字符串（旧格式，UTC，"2026-07-04 17:51:00"），
- *   末尾追加 'Z' 让 JS 按 UTC 解析。仅用于兼容 migrate_v4_to_v5 之前的
- *   历史数据；新数据统一为 RFC 3339。
  *
  * 输出统一为北京时间（Asia/Shanghai，UTC+8），格式 "2026-07-05 01:51:00"。
  * 显式指定时区，避免依赖浏览器/服务器本地时区设置。本项目面向中国用户，
@@ -28,14 +25,9 @@ export function formatDate(ts: number | string | null | undefined): string {
     d = new Date(ts * 1000)
   } else {
     if (!ts) return "-"
-    if (ts.includes("T") && (ts.includes("+") || ts.endsWith("Z"))) {
-      // RFC 3339 带时区（新格式）—— JS 原生解析
-      d = new Date(ts)
-    } else {
-      // 旧格式 SQLite datetime('now') UTC 文本 "2026-07-04 17:51:00"
-      // 末尾追加 'Z' 让 JS 按 UTC 解析
-      d = new Date(ts.replace(" ", "T") + "Z")
-    }
+    // RFC 3339 带时区字符串（如 "2026-07-05T01:51:00+08:00"），
+    // JS `new Date()` 原生解析。项目不做向后兼容，不再处理旧格式。
+    d = new Date(ts)
   }
   if (isNaN(d.getTime())) return String(ts)
   // 显式指定 Asia/Shanghai 时区，确保无论运行环境时区如何都显示北京时间

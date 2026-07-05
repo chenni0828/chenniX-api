@@ -2,12 +2,31 @@ use rusqlite::Connection;
 use chennix_common::ProxyResult;
 
 pub fn init_db(conn: &Connection) -> ProxyResult<()> {
+    // 在任何 CREATE TABLE 之前检测是否为全新库。
+    // 判据：models 表不存在（models 是 init_db 创建的第一张业务表）。
+    //
+    // 全新库会在末尾直接写入 schema_version=CURRENT_SCHEMA_VERSION，
+    // 让 run_migrations 跳过版本校验。老库（models 表已存在）不写 marker，
+    // 由 run_migrations 校验版本号是否匹配。
+    //
+    // 这个检测必须前置——一旦 CREATE TABLE IF NOT EXISTS 执行后，老库和
+    // 新库的 sqlite_master 就无法区分了。
+    let is_fresh_db = {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='models'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        count == 0
+    };
+
     let statements = [
         "CREATE TABLE IF NOT EXISTS models (
             id INTEGER PRIMARY KEY,
             canonical_name TEXT NOT NULL UNIQUE,
-            input_price REAL NOT NULL DEFAULT 0.0,
-            output_price REAL NOT NULL DEFAULT 0.0,
             routing_strategy TEXT NOT NULL DEFAULT 'priority',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );",
@@ -93,6 +112,14 @@ pub fn init_db(conn: &Connection) -> ProxyResult<()> {
             channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
             upstream_model_name TEXT NOT NULL,
             weight INTEGER NOT NULL DEFAULT 1,
+            -- Per-binding pricing. billing_type: 0=按 token, 1=按调用次数, 2=分段表达式
+            billing_type INTEGER NOT NULL DEFAULT 0,
+            input_price REAL NOT NULL DEFAULT 0.0,
+            output_price REAL NOT NULL DEFAULT 0.0,
+            call_price REAL NOT NULL DEFAULT 0.0,
+            billing_expr TEXT,
+            -- Per-binding call priority (lower = tried first)
+            priority INTEGER NOT NULL DEFAULT 100,
             PRIMARY KEY (model_id, channel_id, upstream_model_name)
         );",
         "CREATE TABLE IF NOT EXISTS usage_logs (
@@ -144,390 +171,93 @@ pub fn init_db(conn: &Connection) -> ProxyResult<()> {
             request_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (key_id, period_start)
         );",
-        // Drop the legacy model_aliases table (alias system removed).
-        // Idempotent: DROP TABLE IF EXISTS never errors if the table is absent.
-        "DROP TABLE IF EXISTS model_aliases;",
+        // schema_meta: 存储 schema 版本号等元信息。
+        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);",
     ];
     for sql in &statements {
         conn.execute_batch(sql)
             .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
     }
-    // Migrate pricing columns for existing databases.
-    let alter_statements = [
-        // NOTE: input_price/output_price on the `models` table are vestigial —
-        // pricing now lives on `model_channels` (per-binding). These columns are
-        // kept for backward compatibility but no code reads or writes them.
-        "ALTER TABLE models ADD COLUMN input_price REAL NOT NULL DEFAULT 0.0",
-        "ALTER TABLE models ADD COLUMN output_price REAL NOT NULL DEFAULT 0.0",
-        // Pricing on the model↔channel binding (per-channel model pricing).
-        // billing_type: 0=按 token, 1=按调用次数, 2=分段表达式
-        "ALTER TABLE model_channels ADD COLUMN billing_type INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE model_channels ADD COLUMN input_price REAL NOT NULL DEFAULT 0.0",
-        "ALTER TABLE model_channels ADD COLUMN output_price REAL NOT NULL DEFAULT 0.0",
-        "ALTER TABLE model_channels ADD COLUMN call_price REAL NOT NULL DEFAULT 0.0",
-        "ALTER TABLE model_channels ADD COLUMN billing_expr TEXT",
-        // Per-binding call priority (lower = tried first). Replaces the
-        // channel-level `channels.priority` for routing order.
-        "ALTER TABLE model_channels ADD COLUMN priority INTEGER NOT NULL DEFAULT 100",
-        // request_logs: 记录实际调用的上游模型名（与归一化后的 client_model
-        // 区分开），用于审计日志展示「具体调用了哪个上游模型」。
-        "ALTER TABLE request_logs ADD COLUMN upstream_model TEXT",
-    ];
-    for sql in &alter_statements {
-        let _ = conn.execute_batch(sql); // ignore "duplicate column" errors
+
+    // 全新库：直接标记为最新 schema 版本。
+    //
+    // 项目不做向后兼容——新增 schema 变更时，直接修改 init_db 的建表语句
+    // 并递增 CURRENT_SCHEMA_VERSION。老库升级时由 run_migrations 校验
+    // 版本号，不匹配则报错（要求删库重建或用对应版本代码）。
+    if is_fresh_db {
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) \
+             VALUES ('schema_version', ?1)",
+            rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+        tracing::debug!(
+            version = CURRENT_SCHEMA_VERSION,
+            "fresh database initialized, schema_version marker set"
+        );
     }
+
     Ok(())
 }
 
-/// Migrate a v1 database (single-user, no `users`/`tokens` tables) to the v2
-/// multi-user schema. Safe to call on fresh v2 databases — it detects whether
-/// the `users` table already exists and does nothing in that case.
-pub fn migrate_v1_to_v2(conn: &Connection) -> ProxyResult<()> {
-    let has_users: i64 = conn
+/// 当前 schema 版本。`init_db` 创建新库时直接写入此值。
+///
+/// 项目不做向后兼容：版本号只是一个递增计数器，用于判断数据库是否
+/// 与当前代码匹配。数字本身没有语义（不对应具体的表结构特征）。
+/// 每次 `init_db` 的建表语句有变更时递增此常量。
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// 读取数据库的 schema 版本号。
+///
+/// 仅从 `schema_meta.schema_version` marker 读取。新库由 `init_db`
+/// 直接写入最新版本号；老库若无此 marker，返回 0 表示版本未知，
+/// `run_migrations` 会报错。
+pub fn get_current_schema_version(conn: &Connection) -> ProxyResult<u32> {
+    let value: Option<String> = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
+            "SELECT value FROM schema_meta WHERE key='schema_version'",
             [],
             |r| r.get(0),
         )
-        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-
-    if has_users == 0 {
-        // Create users + tokens tables (idempotent — won't fail if somehow present).
-        let create_statements = [
-            "CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                role INTEGER NOT NULL DEFAULT 1,
-                status INTEGER NOT NULL DEFAULT 1,
-                quota INTEGER NOT NULL DEFAULT 0,
-                used_quota INTEGER NOT NULL DEFAULT 0,
-                \"group\" TEXT NOT NULL DEFAULT 'default',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
-            "CREATE TABLE IF NOT EXISTS tokens (
-                id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                key TEXT NOT NULL UNIQUE,
-                name TEXT,
-                remain_quota INTEGER NOT NULL DEFAULT 0,
-                used_quota INTEGER NOT NULL DEFAULT 0,
-                unlimited_quota INTEGER NOT NULL DEFAULT 0,
-                expired_time INTEGER NOT NULL DEFAULT -1,
-                model_limits_enabled INTEGER NOT NULL DEFAULT 0,
-                model_limits TEXT,
-                status INTEGER NOT NULL DEFAULT 1,
-                allow_ips TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
-            "CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);",
-            "CREATE INDEX IF NOT EXISTS idx_tokens_key ON tokens(key);",
-        ];
-        for sql in &create_statements {
-            conn.execute_batch(sql)
-                .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-        }
-
-        // Add new columns to existing v1 tables. Use .ok() to ignore
-        // "duplicate column name" errors so the migration is idempotent.
-        let alter_statements = [
-            "ALTER TABLE channels ADD COLUMN \"group\" TEXT NOT NULL DEFAULT 'default'",
-            "ALTER TABLE usage_logs ADD COLUMN user_id INTEGER REFERENCES users(id)",
-            "ALTER TABLE usage_logs ADD COLUMN token_id INTEGER REFERENCES tokens(id)",
-            "ALTER TABLE usage_logs ADD COLUMN quota_cost INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE request_logs ADD COLUMN user_id INTEGER",
-            "ALTER TABLE request_logs ADD COLUMN token_id INTEGER",
-            "ALTER TABLE request_logs ADD COLUMN quota_cost INTEGER NOT NULL DEFAULT 0",
-        ];
-        for sql in &alter_statements {
-            let _ = conn.execute_batch(sql);
-        }
-
-        // Insert a minimal default admin row. The real admin provisioning
-        // (proper bcrypt hash, password setup) is handled in Task 23
-        // (ensure_default_admin). Here we only insert if no admin exists yet.
-        let admin_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM users WHERE username = 'admin'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-        if admin_count == 0 {
-            let now = crate::now_iso8601();
-            conn.execute(
-                "INSERT INTO users (username, password_hash, role, status, \"group\",
-                                    created_at, updated_at)
-                 VALUES ('admin', 'PLACEHOLDER_BCRYPT_HASH', 10, 1, 'default', ?1, ?1)",
-                [&now],
-            )
-            .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-        }
-    }
-    Ok(())
+        .ok();
+    Ok(value.and_then(|s| s.parse().ok()).unwrap_or(0))
 }
 
-/// Check whether a column exists on a table (PRAGMA table_info based).
-fn column_exists(conn: &Connection, table: &str, column: &str) -> ProxyResult<bool> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({})", table))
-        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-    let exists = stmt
-        .query_map([], |r| r.get::<_, String>(1))
-        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?
-        .any(|r| r.map(|c| c == column).unwrap_or(false));
-    Ok(exists)
-}
-
-/// Migrate a v2 database to v3: introduces the `model_channels` 3-tuple
-/// primary key `(model_id, channel_id, upstream_model_name)` plus the `weight`
-/// column, the `models.routing_strategy` column, and the six quota columns on
-/// `discovered_models`.
+/// 校验数据库 schema 版本是否匹配代码版本。
 ///
-/// Safe to call on fresh v3 databases — it detects whether the new columns
-/// already exist and skips the corresponding step in that case.
-pub fn migrate_v2_to_v3(conn: &Connection) -> ProxyResult<()> {
-    // 1. Rebuild model_channels with the 3-tuple primary key + weight.
-    //    SQLite cannot ALTER a primary key, so we recreate the table.
-    //    Idempotency: skip if the `weight` column already exists (new schema).
-    if !column_exists(conn, "model_channels", "weight")? {
-        // The rebuilt table reproduces every column the old table gained via
-        // ALTER (billing/pricing/priority) so migrated bindings keep their data.
-        conn.execute_batch(
-            "CREATE TABLE model_channels_new (
-                model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-                channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-                upstream_model_name TEXT NOT NULL,
-                weight INTEGER NOT NULL DEFAULT 1,
-                billing_type INTEGER NOT NULL DEFAULT 0,
-                input_price REAL NOT NULL DEFAULT 0.0,
-                output_price REAL NOT NULL DEFAULT 0.0,
-                call_price REAL NOT NULL DEFAULT 0.0,
-                billing_expr TEXT,
-                priority INTEGER NOT NULL DEFAULT 100,
-                PRIMARY KEY (model_id, channel_id, upstream_model_name)
-            );",
-        )
-        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+/// 不做迁移——项目面向未来，不做向后兼容。版本不匹配直接报错，
+/// 让用户用对应版本的代码或删库重建。
+pub fn run_migrations(conn: &Connection) -> ProxyResult<()> {
+    let current = get_current_schema_version(conn)?;
+    let target = CURRENT_SCHEMA_VERSION;
 
-        // Copy old rows. `upstream_model_name` was nullable in v2; coerce NULL
-        // to '' so the new NOT NULL PK column is satisfied. `weight` defaults
-        // to 1 for all migrated bindings. The old 2-tuple PK guaranteed that
-        // (model_id, channel_id) was unique, so the resulting 3-tuple is unique
-        // as well — no PK conflict on INSERT.
-        conn.execute_batch(
-            "INSERT INTO model_channels_new
-                (model_id, channel_id, upstream_model_name, weight,
-                 billing_type, input_price, output_price, call_price,
-                 billing_expr, priority)
-             SELECT model_id, channel_id, COALESCE(upstream_model_name, ''), 1,
-                    billing_type, input_price, output_price, call_price,
-                    billing_expr, priority
-             FROM model_channels;",
-        )
-        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-
-        conn.execute_batch(
-            "DROP TABLE model_channels;
-             ALTER TABLE model_channels_new RENAME TO model_channels;",
-        )
-        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
+    if current != target {
+        return Err(chennix_common::ProxyError::Storage(format!(
+            "schema version mismatch: database is v{}, code expects v{}. \
+             This project does not support backward compatibility. \
+             Either use the matching code version or delete the database \
+             to reinitialize.",
+            current, target
+        )));
     }
 
-    // 2. models.routing_strategy (idempotent ALTER).
-    if !column_exists(conn, "models", "routing_strategy")? {
-        conn.execute_batch(
-            "ALTER TABLE models ADD COLUMN routing_strategy TEXT NOT NULL DEFAULT 'priority'",
-        )
-        .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-    }
-
-    // 3. discovered_models quota columns (idempotent ALTERs).
-    let quota_cols: &[(&str, &str)] = &[
-        ("quota_limit", "ALTER TABLE discovered_models ADD COLUMN quota_limit INTEGER"),
-        ("quota_unit", "ALTER TABLE discovered_models ADD COLUMN quota_unit TEXT"),
-        ("quota_window", "ALTER TABLE discovered_models ADD COLUMN quota_window TEXT"),
-        ("used_quota", "ALTER TABLE discovered_models ADD COLUMN used_quota INTEGER NOT NULL DEFAULT 0"),
-        ("last_reset_at", "ALTER TABLE discovered_models ADD COLUMN last_reset_at TEXT"),
-        ("quota_status", "ALTER TABLE discovered_models ADD COLUMN quota_status TEXT NOT NULL DEFAULT 'available'"),
-    ];
-    for (col, sql) in quota_cols {
-        if !column_exists(conn, "discovered_models", col)? {
-            conn.execute_batch(sql)
-                .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Migrate a v3 database to v4: convert money-quota fields from 元 (yuan)
-/// to 微元 (micro-yuan, 1 元 = 1,000,000 微元) so small per-request costs
-/// are not rounded to zero.
-///
-/// Affected fields (money — NOT token-count fields like
-/// `channel_keys.used_quota` or `discovered_models.used_quota`):
-/// - `users.quota`, `users.used_quota`
-/// - `tokens.remain_quota`, `tokens.used_quota`
-/// - `usage_logs.quota_cost`
-/// - `request_logs.quota_cost`
-///
-/// Idempotency: uses a `schema_meta` table marker to skip on fresh v4 or
-/// already-migrated databases.
-pub fn migrate_v3_to_v4(conn: &Connection) -> ProxyResult<()> {
-    // Idempotency: check the migration marker.
-    let migrated: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type='table' AND name='schema_meta'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if migrated > 0 {
-        let done: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM schema_meta WHERE key='v4_micro_yuan'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if done > 0 {
-            return Ok(());
-        }
-    }
-
-    // Multiply all money-quota fields by 1,000,000.
-    // Fields that are 0 stay 0; NULL-safe (COALESCE not needed — all are
-    // NOT NULL DEFAULT 0 in the schema).
-    let scale: i64 = 1_000_000;
-    conn.execute_batch(&format!(
-        "UPDATE users SET quota = quota * {scale}, used_quota = used_quota * {scale};
-         UPDATE tokens SET remain_quota = remain_quota * {scale}, used_quota = used_quota * {scale};
-         UPDATE usage_logs SET quota_cost = quota_cost * {scale};
-         UPDATE request_logs SET quota_cost = quota_cost * {scale};",
-    ))
-    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-
-    // Record the migration marker.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
-         INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('v4_micro_yuan', 'done');",
-    )
-    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-
-    tracing::info!("migrate_v3_to_v4: converted money-quota fields to micro-yuan (×1,000,000)");
-    Ok(())
-}
-
-/// Migrate v4 → v5: convert all `created_at` / `updated_at` / time fields
-/// from SQLite `datetime('now')` UTC text (format `2026-07-04 17:51:00`,
-/// no timezone suffix, semantically UTC) to RFC 3339 with explicit
-/// `+08:00` offset (format `2026-07-05T01:51:00+08:00`, semantically
-/// Beijing time).
-///
-/// This fixes the dashboard "today" timezone bug where `DATE('now')`
-/// returned the UTC date, causing Beijing-time 00:00–08:00 requests to
-/// be counted as "yesterday".
-///
-/// Affected tables/fields:
-/// - `models.created_at`
-/// - `users.created_at`, `users.updated_at`
-/// - `tokens.created_at`, `tokens.updated_at`
-/// - `channels.created_at`, `channels.updated_at`
-/// - `channel_keys.created_at`, `channel_keys.updated_at`
-/// - `discovered_models.discovered_at`, `discovered_models.last_reset_at`
-/// - `usage_logs.created_at`
-/// - `request_logs.created_at`
-///
-/// Conversion: for each field, `datetime(field, '+8 hours')` shifts the
-/// UTC value to Beijing time, then `REPLACE(..., ' ', 'T') || '+08:00'`
-/// reformats to RFC 3339. Rows already in RFC 3339 (containing `T` and
-/// a timezone marker) are left untouched, making the migration safe to
-/// re-run.
-///
-/// Idempotency: uses the same `schema_meta` marker table as v3→v4.
-pub fn migrate_v4_to_v5(conn: &Connection) -> ProxyResult<()> {
-    // Idempotency: check the migration marker.
-    let migrated: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE type='table' AND name='schema_meta'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if migrated > 0 {
-        let done: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM schema_meta WHERE key='v5_iso8601_tz'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if done > 0 {
-            return Ok(());
-        }
-    }
-
-    // Conversion template: shift UTC → Beijing, reformat to RFC 3339.
-    // `datetime(x, '+8 hours')` works correctly for both:
-    //   - legacy `'2026-07-04 17:51:00'` (SQLite treats as UTC, +8h → Beijing)
-    //   - already-migrated `'2026-07-05T01:51:00+08:00'` (SQLite normalizes
-    //     to UTC first, then +8h → Beijing; idempotent)
-    // The WHERE clause skips rows already in RFC 3339 (containing 'T' and
-    // either '+' or 'Z') to avoid double-conversion on re-runs.
-    let convert_sql = |table: &str, col: &str| {
-        format!(
-            "UPDATE {table} SET {col} = \
-                REPLACE(datetime({col}, '+8 hours'), ' ', 'T') || '+08:00' \
-             WHERE {col} IS NOT NULL \
-               AND {col} NOT LIKE '%T%' \
-               AND {col} NOT LIKE '%Z%';"
-        )
-    };
-
-    conn.execute_batch(&format!(
-        "{};{};{};{};{};{};{};{};{};{};{};",
-        convert_sql("models", "created_at"),
-        convert_sql("users", "created_at"),
-        convert_sql("users", "updated_at"),
-        convert_sql("tokens", "created_at"),
-        convert_sql("tokens", "updated_at"),
-        convert_sql("channels", "created_at"),
-        convert_sql("channels", "updated_at"),
-        convert_sql("channel_keys", "created_at"),
-        convert_sql("channel_keys", "updated_at"),
-        convert_sql("discovered_models", "discovered_at"),
-        convert_sql("discovered_models", "last_reset_at"),
-    ))
-    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-
-    // usage_logs and request_logs can be large; update in separate batches
-    // to avoid holding a single large transaction.
-    conn.execute_batch(&format!(
-        "{};{};",
-        convert_sql("usage_logs", "created_at"),
-        convert_sql("request_logs", "created_at"),
-    ))
-    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-
-    // Record the migration marker.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
-         INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('v5_iso8601_tz', 'done');",
-    )
-    .map_err(|e| chennix_common::ProxyError::Storage(e.to_string()))?;
-
-    tracing::info!("migrate_v4_to_v5: converted time fields to RFC 3339 +08:00 (Beijing time)");
+    tracing::debug!(current = current, "schema version OK");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table)).unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
+        rows
+    }
 
     #[test]
     fn test_init_db_creates_tables() {
@@ -538,8 +268,8 @@ mod tests {
             .unwrap();
         // models, users, tokens, channels, channel_keys,
         // discovered_models, model_channels, usage_logs, request_logs,
-        // key_usage_summary = 10 tables.
-        assert!(count >= 9);
+        // key_usage_summary, schema_meta = 11 tables.
+        assert!(count >= 10);
     }
 
     #[test]
@@ -547,16 +277,6 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         init_db(&conn).unwrap(); // 不应报错
-    }
-
-    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table)).unwrap();
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect::<Vec<_>>();
-        rows
     }
 
     #[test]
@@ -570,10 +290,6 @@ mod tests {
         ] {
             assert!(cols.contains(&expected.to_string()), "users missing column: {}", expected);
         }
-        // username must be unique
-        let _: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pragma_index_list('users')", [], |r| r.get(0))
-            .unwrap();
     }
 
     #[test]
@@ -588,15 +304,6 @@ mod tests {
         ] {
             assert!(cols.contains(&expected.to_string()), "tokens missing column: {}", expected);
         }
-        // Indexes on tokens(user_id) and tokens(key) should exist.
-        let idx_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='tokens'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(idx_count >= 2, "expected at least 2 indexes on tokens, got {}", idx_count);
     }
 
     #[test]
@@ -604,7 +311,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let cols = column_names(&conn, "channels");
-        assert!(cols.contains(&"group".to_string()), "channels missing 'group' column");
+        assert!(cols.contains(&"group".to_string()));
     }
 
     #[test]
@@ -612,255 +319,82 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         for col in ["user_id", "token_id", "quota_cost"] {
-            assert!(
-                column_names(&conn, "usage_logs").contains(&col.to_string()),
-                "usage_logs missing column: {}", col
-            );
-            assert!(
-                column_names(&conn, "request_logs").contains(&col.to_string()),
-                "request_logs missing column: {}", col
-            );
-        }
-    }
-
-    #[test]
-    fn test_migrate_v1_to_v2() {
-        let conn = Connection::open_in_memory().unwrap();
-        // Build a v1-style schema (no users/tokens, no new columns).
-        conn.execute_batch(
-            "CREATE TABLE channels (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                provider TEXT NOT NULL,
-                base_url TEXT NOT NULL,
-                priority INTEGER NOT NULL DEFAULT 100,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE usage_logs (
-                id INTEGER PRIMARY KEY,
-                channel_id INTEGER NOT NULL,
-                key_id INTEGER NOT NULL,
-                model_id INTEGER NOT NULL,
-                prompt_tokens INTEGER NOT NULL,
-                completion_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL,
-                request_type TEXT NOT NULL,
-                status TEXT NOT NULL,
-                error_message TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE request_logs (
-                id INTEGER PRIMARY KEY,
-                request_id TEXT NOT NULL,
-                client_ip TEXT,
-                method TEXT NOT NULL,
-                path TEXT NOT NULL,
-                client_model TEXT,
-                normalized_model TEXT,
-                channel_name TEXT,
-                key_label TEXT,
-                attempted_keys TEXT,
-                upstream_status INTEGER,
-                response_status INTEGER,
-                duration_ms INTEGER NOT NULL,
-                stream INTEGER NOT NULL DEFAULT 0,
-                error_message TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );",
-        )
-        .unwrap();
-
-        // Run migration.
-        migrate_v1_to_v2(&conn).unwrap();
-
-        // users + tokens should now exist.
-        let has_users: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(has_users, 1);
-        let has_tokens: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tokens'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(has_tokens, 1);
-
-        // New columns should be present on existing v1 tables.
-        assert!(column_names(&conn, "channels").contains(&"group".to_string()));
-        for col in ["user_id", "token_id", "quota_cost"] {
             assert!(column_names(&conn, "usage_logs").contains(&col.to_string()));
             assert!(column_names(&conn, "request_logs").contains(&col.to_string()));
         }
-
-        // Default admin row should be present.
-        let admin_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM users WHERE username = 'admin'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(admin_count, 1);
-
-        // Migration must be idempotent.
-        migrate_v1_to_v2(&conn).unwrap();
-        let admin_count_again: i64 = conn
-            .query_row("SELECT COUNT(*) FROM users WHERE username = 'admin'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(admin_count_again, 1, "admin should not be duplicated on re-run");
     }
 
     #[test]
-    fn test_models_has_pricing_columns() {
+    fn test_model_channels_has_pricing_columns() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        let cols = column_names(&conn, "models");
-        assert!(cols.contains(&"input_price".to_string()), "models missing 'input_price' column");
-        assert!(cols.contains(&"output_price".to_string()), "models missing 'output_price' column");
-    }
-
-    #[test]
-    fn test_migrate_v1_to_v2_on_fresh_db() {
-        // A fresh v2 DB already has users — migration should be a no-op.
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        let tables_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
-            .unwrap();
-        migrate_v1_to_v2(&conn).unwrap();
-        let tables_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(tables_before, tables_after);
-        // No admin row should have been inserted by migrate on a fresh v2 DB
-        // (init_db does not create admin, and migrate short-circuits when users exists).
-        let admin_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM users WHERE username = 'admin'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(admin_count, 0);
-    }
-
-    #[test]
-    fn test_migrate_v2_to_v3() {
-        // Build a v2-style schema for the three affected tables (no routing_strategy,
-        // no weight, no quota columns, 2-tuple PK on model_channels).
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE models (
-                id INTEGER PRIMARY KEY,
-                canonical_name TEXT NOT NULL UNIQUE,
-                input_price REAL NOT NULL DEFAULT 0.0,
-                output_price REAL NOT NULL DEFAULT 0.0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE channels (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                provider TEXT NOT NULL,
-                base_url TEXT NOT NULL,
-                priority INTEGER NOT NULL DEFAULT 100,
-                \"group\" TEXT NOT NULL DEFAULT 'default',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE discovered_models (
-                id INTEGER PRIMARY KEY,
-                channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-                raw_model_name TEXT NOT NULL,
-                discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
-                status TEXT NOT NULL DEFAULT 'unmerged',
-                merged_to_model_id INTEGER REFERENCES models(id),
-                is_free INTEGER NOT NULL DEFAULT 0,
-                source TEXT,
-                metadata TEXT,
-                UNIQUE(channel_id, raw_model_name)
-            );
-            CREATE TABLE model_channels (
-                model_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
-                channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-                upstream_model_name TEXT,
-                billing_type INTEGER NOT NULL DEFAULT 0,
-                input_price REAL NOT NULL DEFAULT 0.0,
-                output_price REAL NOT NULL DEFAULT 0.0,
-                call_price REAL NOT NULL DEFAULT 0.0,
-                billing_expr TEXT,
-                priority INTEGER NOT NULL DEFAULT 100,
-                PRIMARY KEY (model_id, channel_id)
-            );
-            INSERT INTO models (id, canonical_name) VALUES (1, 'gpt-4o');
-            INSERT INTO channels (id, name, provider, base_url) VALUES (2, 'openai', 'openai-compatible', 'http://x');
-            INSERT INTO model_channels (model_id, channel_id, upstream_model_name, priority)
-            VALUES (1, 2, 'gpt-4o', 50);",
-        )
-        .unwrap();
-
-        migrate_v2_to_v3(&conn).unwrap();
-
-        // models.routing_strategy added with default 'priority'.
-        let cols_m = column_names(&conn, "models");
-        assert!(cols_m.contains(&"routing_strategy".to_string()));
-        let strat: String = conn
-            .query_row("SELECT routing_strategy FROM models WHERE id=1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(strat, "priority");
-
-        // discovered_models quota columns added.
-        let cols_d = column_names(&conn, "discovered_models");
-        for c in ["quota_limit", "quota_unit", "quota_window", "used_quota", "last_reset_at", "quota_status"] {
-            assert!(cols_d.contains(&c.to_string()), "discovered_models missing {}", c);
+        let cols = column_names(&conn, "model_channels");
+        for expected in [
+            "billing_type", "input_price", "output_price", "call_price",
+            "billing_expr", "priority", "weight",
+        ] {
+            assert!(cols.contains(&expected.to_string()), "model_channels missing: {}", expected);
         }
+    }
 
-        // model_channels: weight added; old row preserved (weight=1, priority=50,
-        // upstream_model_name carried over).
-        let cols_c = column_names(&conn, "model_channels");
-        assert!(cols_c.contains(&"weight".to_string()));
-        let (weight, priority): (i32, i32) = conn
-            .query_row(
-                "SELECT weight, priority FROM model_channels
-                 WHERE model_id=1 AND channel_id=2 AND upstream_model_name='gpt-4o'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(weight, 1);
-        assert_eq!(priority, 50);
+    /// 新库 init_db 后 schema_version 应为 CURRENT_SCHEMA_VERSION。
+    #[test]
+    fn test_fresh_db_gets_latest_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let v = get_current_schema_version(&conn).unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+    }
 
-        // 3-tuple PK: same (model_id, channel_id) with a different upstream is
-        // now allowed, while a duplicate 3-tuple is rejected.
+    /// run_migrations 对版本匹配的库应直接通过（no-op）。
+    #[test]
+    fn test_run_migrations_on_matching_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_migrations(&conn).unwrap(); // 版本匹配，直接通过
+    }
+
+    /// run_migrations 对版本不匹配的库应报错。
+    #[test]
+    fn test_run_migrations_rejects_version_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // 篡改版本号模拟不匹配的数据库
         conn.execute(
-            "INSERT INTO model_channels (model_id, channel_id, upstream_model_name)
-             VALUES (1, 2, 'gpt-4o-mini')",
+            "UPDATE schema_meta SET value='99' WHERE key='schema_version'",
             [],
         )
         .unwrap();
-        let dup = conn.execute(
-            "INSERT INTO model_channels (model_id, channel_id, upstream_model_name)
-             VALUES (1, 2, 'gpt-4o')",
-            [],
-        );
-        assert!(dup.is_err(), "duplicate 3-tuple must be rejected");
-
-        // Idempotent: re-running on an already-v3 DB is a no-op.
-        migrate_v2_to_v3(&conn).unwrap();
+        let err = run_migrations(&conn).unwrap_err();
+        match err {
+            chennix_common::ProxyError::Storage(msg) => {
+                assert!(msg.contains("version mismatch"), "unexpected error: {}", msg);
+                assert!(msg.contains("v99"), "unexpected error: {}", msg);
+                assert!(
+                    msg.contains(&format!("v{}", CURRENT_SCHEMA_VERSION)),
+                    "unexpected error: {}", msg
+                );
+            }
+            _ => panic!("expected Storage error, got {:?}", err),
+        }
     }
 
+    /// 无 schema_version marker 的库（模拟未知老库）应被识别为 v0 并报错。
     #[test]
-    fn test_migrate_v2_to_v3_noop_on_fresh_v3() {
-        // A fresh DB built by init_db is already v3 — migration must be a no-op.
+    fn test_run_migrations_rejects_unknown_db() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        let tables_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
+        // 删除 marker 模拟无版本号的老库
+        conn.execute("DELETE FROM schema_meta WHERE key='schema_version'", [])
             .unwrap();
-        migrate_v2_to_v3(&conn).unwrap();
-        let tables_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(tables_before, tables_after);
-        // weight column present (init_db already created it).
-        assert!(column_names(&conn, "model_channels").contains(&"weight".to_string()));
+        let v = get_current_schema_version(&conn).unwrap();
+        assert_eq!(v, 0);
+        let err = run_migrations(&conn).unwrap_err();
+        match err {
+            chennix_common::ProxyError::Storage(msg) => {
+                assert!(msg.contains("v0"), "unexpected error: {}", msg);
+            }
+            _ => panic!("expected Storage error, got {:?}", err),
+        }
     }
 }

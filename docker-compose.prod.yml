@@ -1,0 +1,62 @@
+# chennix-api 生产部署 docker-compose（拉镜像版）
+#
+# 与 docker-compose.yml 的区别：
+#   - 用 image: 从 GHCR 拉镜像，不在服务器上构建
+#   - 删除 build: 块
+#   - 适用于 1C2G 等资源受限服务器
+#
+# 使用方法：
+#   1. 把 <your-github-username> 替换为你的 GitHub 用户名（小写）
+#   2. 修改 Caddyfile 中的域名为你的域名
+#   3. 修改 .env 中的管理员密码
+#   4. docker compose -f docker-compose.prod.yml up -d
+#
+# 更新流程：
+#   docker compose -f docker-compose.prod.yml pull && \
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  chennix-api:
+    image: ghcr.io/<your-github-username>/chennix-api:latest
+    # 若仓库同名（不区分大小写），image 名与仓库名一致；
+    # GHCR 要求全小写，构建时 workflow 已自动处理。
+    container_name: chennix-api
+    restart: always
+    environment:
+      - TZ=Asia/Shanghai
+      - RUST_LOG=info
+      - PORT=8080
+      - HOST=0.0.0.0
+      - DB_PATH=/data/chennix.db
+      - CHENNIX_ADMIN_PASSWORD=${CHENNIX_ADMIN_PASSWORD:-}
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      chennix-api:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

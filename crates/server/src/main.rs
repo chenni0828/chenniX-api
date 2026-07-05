@@ -65,21 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Open DB + init schema
     let conn = open_db(&config.database.path)?;
-    // Apply v1→v2 migration (no-op on fresh v2 databases).
-    chennix_storage::schema::migrate_v1_to_v2(&conn)?;
-    // Apply v2→v3 migration: model_channels 3-tuple PK + weight,
-    // models.routing_strategy, discovered_models quota columns
-    // (no-op on fresh v3 databases).
-    chennix_storage::schema::migrate_v2_to_v3(&conn)?;
-    // Apply v3→v4 migration: convert money-quota fields to micro-yuan
-    // (×1,000,000) for integer-precision billing. Idempotent via
-    // schema_meta marker table.
-    chennix_storage::schema::migrate_v3_to_v4(&conn)?;
-    // Apply v4→v5 migration: convert all time fields from SQLite
-    // `datetime('now')` UTC text to RFC 3339 with explicit `+08:00`
-    // (Beijing time) offset. Fixes the dashboard "today" timezone bug.
-    // Idempotent via schema_meta marker table.
-    chennix_storage::schema::migrate_v4_to_v5(&conn)?;
+    // 统一迁移入口：内部读取 schema_version，按需跳转到最新版本，
+    // 只跑必要的迁移段（旧逻辑是每次启动都顺序跑 4 个函数各自检查 marker）。
+    chennix_storage::schema::run_migrations(&conn)?;
 
     // 4. Ensure default admin
     config::ensure_default_admin(&conn)?;
@@ -230,7 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigterm =
             signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-        let shutdown = async {
+        // 必须 `async move`：`with_graceful_shutdown` 要求 future 为 'static，
+        // 而 `sigterm.recv()` 借用了局部 `&mut sigterm`。用 `async move` 把
+        // `sigterm` 所有权移入 future，避免 Rust 1.80+ 的 E0373 编译错误。
+        let shutdown = async move {
             tokio::select! {
                 _ = signal::ctrl_c() => {
                     tracing::info!("Received SIGINT, gracefully stopping...");

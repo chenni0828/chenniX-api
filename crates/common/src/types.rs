@@ -348,8 +348,6 @@ pub struct RequestLog {
     pub quota_cost: i64,
     pub error_message: Option<String>,
     /// RFC 3339 timestamp with `+08:00` offset, e.g. `"2026-07-01T12:34:56+08:00"`.
-    /// Prior to migrate_v4_to_v5, this was a SQLite `datetime('now')` UTC text
-    /// like `"2026-07-01 04:34:56"`; old rows are converted on migration.
     pub created_at: String,
 }
 

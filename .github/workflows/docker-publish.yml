@@ -1,0 +1,83 @@
+# 在 GitHub Actions 上构建并推送 Docker 镜像到 GHCR
+#
+# 触发条件：
+#   - push 到 main 分支（且改动了 src/Dockerfile/Cargo.toml 等关键文件）
+#   - 手动触发（Actions 页面 → Run workflow）
+#   - 发布 Release
+#
+# 服务器端只需 docker pull + docker compose up -d，避免在 1C2G 服务器上构建 OOM。
+#
+# 前置条件：
+#   1. 仓库 Settings → Actions → General → Workflow permissions 设为 "Read and write"
+#   2. （可选）Settings → Secrets → Actions 添加 GHCR_TOKEN（PAT with write:packages）
+#      若不添加，workflow 会自动使用 GITHUB_TOKEN（默认权限即可推到当前仓库的 namespace）
+
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**/src/**"
+      - "crates/**/Cargo.toml"
+      - "crates/server/web/src/**"
+      - "crates/server/web/package*.json"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - ".github/workflows/docker-publish.yml"
+    tags: ["v*"]
+  workflow_dispatch: # 支持手动触发
+
+env:
+  REGISTRY: ghcr.io
+  # 镜像名小写（GHCR 要求），格式：ghcr.io/<owner>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # 推送到 GHCR 需要的权限
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU（多架构支持）
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN 是 Actions 自动注入的，无需手动创建 secret
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short # 每次构建带 commit hash 标签，便于回滚
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha # GitHub Actions 缓存，加速二次构建
+          cache-to: type=gha,mode=max

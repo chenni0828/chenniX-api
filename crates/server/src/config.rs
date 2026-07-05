@@ -211,34 +211,6 @@ pub fn ensure_default_admin(conn: &Connection) -> ProxyResult<()> {
         return Ok(());
     }
 
-    // Fix placeholder password hash left by migrate_v1_to_v2.
-    let placeholder: Option<String> = conn
-        .query_row(
-            "SELECT password_hash FROM users WHERE username = 'admin'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-
-    if placeholder.as_deref() == Some("PLACEHOLDER_BCRYPT_HASH") {
-        let password = std::env::var("CHENNIX_ADMIN_PASSWORD")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| "admin123".to_string());
-        let password_hash =
-            bcrypt::hash(&password, bcrypt::DEFAULT_COST).map_err(|e| {
-                ProxyError::Config(format!("bcrypt hash failed: {}", e))
-            })?;
-
-        conn.execute(
-            "UPDATE users SET password_hash = ?1 WHERE username = 'admin'",
-            rusqlite::params![password_hash],
-        )
-        .map_err(|e| ProxyError::Storage(e.to_string()))?;
-
-        tracing::info!("fixed default admin password (was PLACEHOLDER_BCRYPT_HASH)");
-    }
-
     Ok(())
 }
 

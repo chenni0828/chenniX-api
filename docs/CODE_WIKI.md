@@ -218,12 +218,11 @@ pub fn open_db(path: &str) -> ProxyResult<Connection>
 
 ### 6.1 Schema — [schema.rs](file:///c:/Users/chenniX/Desktop/chenniX-api/crates/storage/src/schema.rs)
 
-`init_db(conn)` 创建全部 11 张表（`CREATE TABLE IF NOT EXISTS`，幂等）：
+`init_db(conn)` 创建全部 11 张表（10 张业务表 + `schema_meta`，`CREATE TABLE IF NOT EXISTS`，幂等）：
 
 | 表 | 用途 |
 |----|------|
-| `models` | 标准模型（`canonical_name` 唯一，含 `input_price`/`output_price`） |
-| `model_aliases` | 别名 → model_id（alias 唯一） |
+| `models` | 标准模型（`canonical_name` 唯一，`routing_strategy`） |
 | `users` | 用户（username 唯一，bcrypt 密码，role/status/quota/used_quota/group） |
 | `tokens` | 用户的 API Key（key 唯一，remain_quota/used_quota/unlimited_quota/expired_time/model_limits/allow_ips/status），索引 `idx_tokens_user`、`idx_tokens_key` |
 | `channels` | 渠道（name 唯一，provider/base_url/priority/group） |
@@ -234,7 +233,7 @@ pub fn open_db(path: &str) -> ProxyResult<Connection>
 | `request_logs` | 请求日志（request_id/client_ip/状态码/耗时/stream/attempted_keys 等） |
 | `key_usage_summary` | Key 周期用量汇总（联合主键 key_id+period_start） |
 
-`migrate_v1_to_v2(conn)` — 将旧版单用户数据库升级到多用户 schema（建 users/tokens 表、给 channels/usage_logs/request_logs 加列、插入占位 admin 行），对已是 v2 的数据库是 no-op。
+`run_migrations(conn)` — 校验数据库 `schema_version` 是否匹配 `CURRENT_SCHEMA_VERSION`。项目不做向后兼容，版本不匹配直接报错。全新库由 `init_db` 写入最新版本号。
 
 ### 6.2 各 Repo（均持有 `&'a Connection`，方法返回 `ProxyResult<T>`）
 
@@ -514,7 +513,7 @@ pub struct Executor { pub health: Arc<HealthManager>, pub cache: Arc<ConfigCache
 启动流程：
 1. 解析 CLI 第一个参数为 config 路径（默认 `config.yaml`）。
 2. `load_config` + `init_tracing`。
-3. `open_db` + `migrate_v1_to_v2`（已是 v2 则 no-op）。
+3. `open_db` + `run_migrations`（校验 schema 版本，不匹配则报错）。
 4. `ensure_default_admin`（users 表空时创建 `admin/admin123`，role=100）。
 5. `bootstrap::is_db_empty` 时从配置的 `bootstrap.config_file` 导入。
 6. 构建 `AppState`（executor/cache/health/normalizer/storage/db/config/session_store/active_streams）。
@@ -754,7 +753,7 @@ npm run build                   # 产物输出到 crates/server/static/
 
 - **单元测试**：每个 crate 内嵌 `#[cfg(test)] mod tests`，覆盖：
   - common：状态判定、Usage 累加、UserConfig/TokenConfig 序列化与 helper
-  - storage：`init_db` 幂等、`migrate_v1_to_v2`、各表存在性与列
+  - storage：`init_db` 幂等、`run_migrations` 版本校验、各表存在性与列
   - adaptor：`extract_usage` 解析 OpenAI/Claude chunk
   - translator：流式状态机简单文本流、工具调用、finish_reason 映射、usage 时序、多工具、ping 忽略
   - core：router 排序（free/priority/group/ratio/price）、health 冷却退避与恢复、billing 预扣/结算/退款/unlimited、cache invalidate/lazy 加载、executor 错误分类与 select_keys
